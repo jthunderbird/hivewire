@@ -16,13 +16,13 @@ import (
 const reducedDDL = `
 CREATE TABLE session (
   id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
   parent_id TEXT,
   directory TEXT NOT NULL,
   title TEXT NOT NULL,
   version TEXT NOT NULL,
   agent TEXT,
   model TEXT,
-  cost REAL DEFAULT 0 NOT NULL,
   tokens_input INTEGER DEFAULT 0 NOT NULL,
   tokens_output INTEGER DEFAULT 0 NOT NULL,
   tokens_reasoning INTEGER DEFAULT 0 NOT NULL,
@@ -73,9 +73,47 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 func insertSession(t *testing.T, db *sql.DB, id, parent string, created int64) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO session (
-		id,parent_id,directory,title,version,agent,model,time_created,time_updated
-	) VALUES (?,?,?,?,?,?,?,?,?)`, id, parent, "/work", id, "1.15.7", "build", "gpt-5", created, created+1); err != nil {
+		id,project_id,parent_id,directory,title,version,agent,model,time_created,time_updated
+	) VALUES (?,?,?,?,?,?,?,?,?,?)`, id, "project", parent, "/work", id, "1.15.7", "build", "gpt-5", created, created+1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReducedSessionSchemaMatchesQueriedProductionSubset(t *testing.T) {
+	db := fixtureDB(t, filepath.Join(t.TempDir(), "opencode.db"))
+	rows, err := db.Query(`PRAGMA table_info(session)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	projectRequired := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+		if name == "project_id" {
+			projectRequired = notNull == 1
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"id", "project_id", "parent_id", "directory", "title", "version", "agent", "model",
+		"tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write",
+		"time_created", "time_updated",
+	}
+	if !reflect.DeepEqual(columns, want) {
+		t.Fatalf("session columns = %v, want %v", columns, want)
+	}
+	if !projectRequired {
+		t.Fatal("project_id must be NOT NULL")
 	}
 }
 
@@ -163,8 +201,8 @@ func TestNonWALSnapshotCannotWriteOrCreateSidecars(t *testing.T) {
 		t.Fatalf("MaxOpenConnections = %d, want 1", max)
 	}
 	if _, err := db.db.Exec(`INSERT INTO session (
-		id,parent_id,directory,title,version,time_created,time_updated
-	) VALUES ('written','parent','/work','bad','1',1,1)`); err == nil {
+		id,project_id,parent_id,directory,title,version,time_created,time_updated
+	) VALUES ('written','project','parent','/work','bad','1',1,1)`); err == nil {
 		t.Fatal("read-only connection accepted a write")
 	}
 
