@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -121,5 +122,48 @@ func TestIndexSurvivesAReload(t *testing.T) {
 	}
 	if _, total := reloaded.Search("hello", 0, 50); total != 1 {
 		t.Fatal("prompts should be searchable after a restart")
+	}
+}
+
+func TestOpenCodeNativeIDSurvivesAReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Upsert(model.Agent{ID: "opencode:ses_123", NativeID: "ses_123", Provider: "opencode"})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := reloaded.Get("opencode:ses_123")
+	if !ok {
+		t.Fatal("reloaded store does not contain OpenCode record")
+	}
+	if record.NativeID != "ses_123" {
+		t.Fatalf("NativeID = %q, want %q", record.NativeID, "ses_123")
+	}
+}
+
+func TestOpenLoadsLegacyIndexWithoutNativeID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.json")
+	if err := os.WriteFile(path, []byte(`[{"id":"claude:1","provider":"claude"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := s.Get("claude:1")
+	if !ok {
+		t.Fatal("legacy record was not loaded")
+	}
+	if record.NativeID != "" {
+		t.Fatalf("NativeID = %q, want empty", record.NativeID)
 	}
 }

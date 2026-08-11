@@ -20,6 +20,7 @@ import (
 // Record is one indexed agent run.
 type Record struct {
 	ID       string       `json:"id"`
+	NativeID string       `json:"nativeId,omitempty"`
 	Provider string       `json:"provider"`
 	Model    string       `json:"model"`
 	Name     string       `json:"name"`
@@ -71,7 +72,7 @@ func (s *Store) Upsert(a model.Agent) {
 	defer s.mu.Unlock()
 	prev := s.recs[a.ID]
 	rec := Record{
-		ID: a.ID, Provider: a.Provider, Model: a.Model, Name: a.Name,
+		ID: a.ID, NativeID: a.NativeID, Provider: a.Provider, Model: a.Model, Name: a.Name,
 		Nickname: a.Nickname, Title: a.Title, Prompt: a.Prompt, Cwd: a.Cwd, Source: a.Source,
 		Started: a.Started, Updated: a.Updated, Status: a.Status,
 		Tokens: a.Tokens, Tools: a.ToolCount,
