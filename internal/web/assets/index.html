@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hivewire</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="bar">
+  <span id="brand">hivewire</span>
+  <span id="conn" class="pill warn">connecting…</span>
+  <span id="counts" class="pill"></span>
+  <span id="pending" class="pill pending hidden"></span>
+  <span class="spacer"></span>
+  <button id="btn-history" type="button">history</button>
+  <button id="btn-reset" type="button" title="reset pane sizes">reset layout</button>
+</header>
+
+<main id="grid">
+  <div class="col" id="col-left">
+    <section class="pane" data-slot="0"></section>
+    <div class="gutter horiz" data-gutter="left"></div>
+    <section class="pane" data-slot="1"></section>
+  </div>
+  <div class="gutter vert" data-gutter="main"></div>
+  <div class="col" id="col-right">
+    <section class="pane" data-slot="2"></section>
+    <div class="gutter horiz" data-gutter="right"></div>
+    <section class="pane" data-slot="3"></section>
+  </div>
+</main>
+
+<div id="drawer" class="hidden">
+  <div id="drawer-head">
+    <strong>history</strong>
+    <span class="muted">past agent runs, replayed from the original transcripts</span>
+    <span class="spacer"></span>
+    <button id="btn-close" type="button">close</button>
+  </div>
+  <div id="drawer-body">
+    <div id="history-pane">
+      <input id="history-search" type="search" placeholder="search title, prompt, agent, model, cwd…" autocomplete="off">
+      <div id="history-count" class="muted"></div>
+      <ul id="history-list"></ul>
+      <button id="history-more" type="button" class="hidden">view more</button>
+    </div>
+    <div id="replay"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
