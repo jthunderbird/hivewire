@@ -122,6 +122,63 @@ func TestResumedBacklogAgentCanTakeSlot(t *testing.T) {
 	}
 }
 
+func TestIneligiblePendingAgentIsRemoved(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  model.Status
+		backlog bool
+	}{
+		{name: "done", status: model.StatusDone},
+		{name: "error", status: model.StatusError},
+		{name: "backlog", status: model.StatusLive, backlog: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New(1, 1<<20)
+			now := time.Now()
+			h.Apply(agent("occupant", model.StatusLive, now))
+			h.Apply(agent("stale", model.StatusLive, now))
+			h.Apply(agent("next", model.StatusLive, now))
+
+			u := agent("stale", tt.status, now.Add(time.Minute))
+			u.Agent.Backlog = tt.backlog
+			h.Apply(u)
+			if got := h.Snapshot().Pending; len(got) != 1 || got[0] != "next" {
+				t.Fatalf("ineligible agent should be removed without reordering waiters: pending = %v", got)
+			}
+
+			h.Apply(agent("occupant", model.StatusDone, now.Add(2*time.Minute)))
+			snap := h.Snapshot()
+			if snap.Slots[0] != "next" || len(snap.Pending) != 0 {
+				t.Fatalf("next eligible waiter should promote: slots=%v pending=%v", snap.Slots, snap.Pending)
+			}
+		})
+	}
+}
+
+func TestFocusRemovesAgentFromPending(t *testing.T) {
+	h := New(2, 1<<20)
+	now := time.Now()
+	for _, id := range []string{"a", "b", "focused", "next"} {
+		h.Apply(agent(id, model.StatusLive, now))
+	}
+
+	h.Focus(0, "focused")
+	snap := h.Snapshot()
+	if snap.Slots[0] != "focused" || snap.Slots[1] != "b" {
+		t.Fatalf("focused agent should occupy requested slot: slots = %v", snap.Slots)
+	}
+	if len(snap.Pending) != 1 || snap.Pending[0] != "next" {
+		t.Fatalf("focused agent should leave pending without reordering waiters: pending = %v", snap.Pending)
+	}
+
+	h.Apply(agent("b", model.StatusDone, now.Add(time.Minute)))
+	snap = h.Snapshot()
+	if snap.Slots[0] != "focused" || snap.Slots[1] != "next" || len(snap.Pending) != 0 {
+		t.Fatalf("next waiter should promote without duplicating focused agent: slots=%v pending=%v", snap.Slots, snap.Pending)
+	}
+}
+
 func TestRingBufferDropsOldestAndSaysSo(t *testing.T) {
 	h := New(1, 512) // tiny budget so the buffer wraps immediately
 	big := string(make([]byte, 300))

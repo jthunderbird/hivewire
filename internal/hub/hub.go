@@ -103,6 +103,9 @@ func (h *Hub) Apply(u provider.Update) {
 	if !existed || resumed {
 		slotsChanged = h.assign(id)
 	}
+	if (st.agent.Status != model.StatusLive || st.agent.Backlog) && h.removePending(id) {
+		slotsChanged = true
+	}
 	if st.agent.Status != model.StatusLive {
 		if h.promote() {
 			slotsChanged = true
@@ -209,6 +212,18 @@ func (h *Hub) assign(id string) bool {
 	return true
 }
 
+func (h *Hub) removePending(id string) bool {
+	kept := h.pending[:0]
+	for _, pendingID := range h.pending {
+		if pendingID != id {
+			kept = append(kept, pendingID)
+		}
+	}
+	changed := len(kept) != len(h.pending)
+	h.pending = kept
+	return changed
+}
+
 // promote moves pending agents into slots freed by finished ones.
 func (h *Hub) promote() bool {
 	changed := false
@@ -304,6 +319,7 @@ func (h *Hub) Focus(slot int, id string) {
 		}
 	}
 	h.slots[slot] = id
+	h.removePending(id)
 	slots := append([]string(nil), h.slots...)
 	pending := append([]string(nil), h.pending...)
 	h.mu.Unlock()
