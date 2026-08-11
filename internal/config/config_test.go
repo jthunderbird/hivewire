@@ -6,23 +6,32 @@ import (
 	"testing"
 )
 
-func TestDefaultOpenCodeDatabase(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
+func TestOpenCodeDataDirFallback(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", "")
 
-	cfg := Default()
-	want := filepath.Join("/home/tester", ".local", "share", "opencode", "opencode.db")
-	if cfg.OpenCodeDB != want {
-		t.Fatalf("OpenCodeDB = %q, want %q", cfg.OpenCodeDB, want)
+	home := filepath.Join("test", "home")
+	want := filepath.Join(home, ".local", "share", "opencode")
+	if got := openCodeDataDir(home); got != want {
+		t.Fatalf("openCodeDataDir(%q) = %q, want %q", home, got, want)
 	}
 }
 
-func TestDefaultOpenCodeDatabaseUsesXDGDataHome(t *testing.T) {
-	t.Setenv("HOME", "/home/tester")
-	t.Setenv("XDG_DATA_HOME", "/var/data")
+func TestOpenCodeDataDirUsesXDGDataHome(t *testing.T) {
+	dataHome := filepath.Join("test", "data")
+	t.Setenv("XDG_DATA_HOME", dataHome)
+
+	want := filepath.Join(dataHome, "opencode")
+	if got := openCodeDataDir(filepath.Join("unused", "home")); got != want {
+		t.Fatalf("openCodeDataDir() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultOpenCodeDatabase(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
 
 	cfg := Default()
-	want := filepath.Join("/var/data", "opencode", "opencode.db")
+	want := filepath.Join(dataHome, "opencode", "opencode.db")
 	if cfg.OpenCodeDB != want {
 		t.Fatalf("OpenCodeDB = %q, want %q", cfg.OpenCodeDB, want)
 	}
