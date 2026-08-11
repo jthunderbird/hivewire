@@ -69,10 +69,13 @@ func (h *Hub) Apply(u provider.Update) {
 
 	id := u.Agent.ID
 	st, existed := h.agents[id]
+	wasLive, wasBacklog := false, false
 	if !existed {
 		st = &state{}
 		h.agents[id] = st
 		h.order = append(h.order, id)
+	} else {
+		wasLive, wasBacklog = st.agent.Status == model.StatusLive, st.agent.Backlog
 	}
 
 	// Provider owns descriptive fields; hub owns buffer accounting.
@@ -96,7 +99,8 @@ func (h *Hub) Apply(u provider.Update) {
 	st.agent.Bytes = st.bytes
 
 	slotsChanged := false
-	if !existed {
+	resumed := existed && (!wasLive || wasBacklog) && st.agent.Status == model.StatusLive && !st.agent.Backlog
+	if !existed || resumed {
 		slotsChanged = h.assign(id)
 	}
 	if st.agent.Status != model.StatusLive {
@@ -160,7 +164,7 @@ func (h *Hub) trim(st *state) {
 	}
 }
 
-// assign places a new agent into a slot. Free slots first, then the
+// assign places an agent into a slot. Free slots first, then the
 // least-recently-updated *finished* agent's slot. A live agent is never bumped;
 // if all slots are live the newcomer waits in the pending strip.
 func (h *Hub) assign(id string) bool {

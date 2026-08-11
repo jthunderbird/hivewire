@@ -84,6 +84,44 @@ func TestBacklogAgentsAreIndexedButNeverShown(t *testing.T) {
 	}
 }
 
+func TestEvictedFinishedAgentRegainsSlotWhenResumed(t *testing.T) {
+	h := New(1, 1<<20)
+	now := time.Now()
+	h.Apply(agent("old", model.StatusLive, now.Add(-time.Minute)))
+	h.Apply(agent("old", model.StatusDone, now.Add(-time.Minute)))
+	h.Apply(agent("replacement", model.StatusLive, now))
+
+	h.Apply(agent("old", model.StatusLive, now.Add(time.Minute)))
+	h.Apply(agent("old", model.StatusLive, now.Add(time.Minute)))
+	snap := h.Snapshot()
+	if snap.Slots[0] != "replacement" {
+		t.Fatalf("resumed agent evicted live replacement: slots = %v", snap.Slots)
+	}
+	if len(snap.Pending) != 1 || snap.Pending[0] != "old" {
+		t.Fatalf("resumed agent should wait once, pending = %v", snap.Pending)
+	}
+
+	h.Apply(agent("replacement", model.StatusDone, now.Add(2*time.Minute)))
+	snap = h.Snapshot()
+	if snap.Slots[0] != "old" || len(snap.Pending) != 0 {
+		t.Fatalf("resumed agent should claim finished replacement's slot: slots=%v pending=%v", snap.Slots, snap.Pending)
+	}
+}
+
+func TestResumedBacklogAgentCanTakeSlot(t *testing.T) {
+	h := New(1, 1<<20)
+	now := time.Now()
+	u := agent("history", model.StatusDone, now)
+	u.Agent.Backlog = true
+	h.Apply(u)
+
+	h.Apply(agent("history", model.StatusLive, now.Add(time.Minute)))
+	snap := h.Snapshot()
+	if snap.Slots[0] != "history" {
+		t.Fatalf("resumed backlog agent should take free slot: slots = %v", snap.Slots)
+	}
+}
+
 func TestRingBufferDropsOldestAndSaysSo(t *testing.T) {
 	h := New(1, 512) // tiny budget so the buffer wraps immediately
 	big := string(make([]byte, 300))
