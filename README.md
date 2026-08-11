@@ -10,13 +10,6 @@ tool results, so they structurally cannot show assistant text, reasoning, or tok
 usage. hivewire instead tails the transcripts both CLIs already write, which contain
 everything — and needs no configuration in either tool to do it.
 
-```
-┌ ● claude · opus-5 · Explore · "audit the tailer"     d1 · 9.9k tok · 3 tools · 8s ─┐
-│ 16:04:12 ⚙ Bash  wc -l internal/tui/tui.go                                         │
-│ 16:04:12 ⮑ 612 internal/tui/tui.go                                                 │
-│ 16:04:14 · Found the wrap() helper is O(n²) on long lines…                         │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
 
 ## Run it
 
@@ -32,6 +25,31 @@ Then open `http://<this-host>:8787/` from any machine on the LAN.
 New subagents appear automatically. Transcripts that already existed when hivewire
 started are indexed for the history browser but never take a live pane, so launching
 it does not replay everything you have ever run.
+
+## Pane details
+
+| Field | Claude | Codex |
+|---|---|---|
+| status dot | green live · gray done · red error | same |
+| provider · model | `message.model` | `turn_context.model` |
+| agent | `agentType` | `basename(agent_path)` + nickname |
+| title | Task `description` | first task message |
+| depth | `spawnDepth` | `thread_spawn.depth` |
+| tokens | summed `usage` | `token_count` totals + context-window % |
+| tools, elapsed | derived | derived |
+| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort |
+
+### TUI
+
+<p align="center">
+  <img src="img/tui.png" alt="hivewire" width="842">
+</p>
+
+### GUI
+
+<p align="center">
+  <img src="img/gui.png" alt="hivewire" width="842">
+</p>
 
 ## Where the data comes from
 
@@ -61,31 +79,6 @@ in `~/.codex/state_5.sqlite` stays `"open"` after completion, so it is not used.
 
 Adding a provider means one file implementing `provider.Provider` — discover
 transcripts, emit `model.Agent` + `model.Event`.
-
-## Pane details
-
-| Field | Claude | Codex |
-|---|---|---|
-| status dot | green live · gray done · red error | same |
-| provider · model | `message.model` | `turn_context.model` |
-| agent | `agentType` | `basename(agent_path)` + nickname |
-| title | Task `description` | first task message |
-| depth | `spawnDepth` | `thread_spawn.depth` |
-| tokens | summed `usage` | `token_count` totals + context-window % |
-| tools, elapsed | derived | derived |
-| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort |
-
-### TUI
-
-<p align="center">
-  <img src="img/tui.png" alt="hivewire" width="842">
-</p>
-
-### GUI
-
-<p align="center">
-  <img src="img/gui.png" alt="hivewire" width="842">
-</p>
 
 ## Nothing is truncated
 
