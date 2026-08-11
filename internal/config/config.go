@@ -23,6 +23,7 @@ type Config struct {
 	IdleDoneSec int    `toml:"idle_done_sec"`
 	ClaudeRoot  string `toml:"claude_root"`
 	CodexRoot   string `toml:"codex_root"`
+	OpenCodeDB  string `toml:"opencode_db"`
 	StateDir    string `toml:"state_dir"`
 	LogFile     string `toml:"log_file"`
 }
@@ -41,8 +42,16 @@ func Default() Config {
 		IdleDoneSec: 300,
 		ClaudeRoot:  filepath.Join(home, ".claude", "projects"),
 		CodexRoot:   filepath.Join(home, ".codex", "sessions"),
+		OpenCodeDB:  filepath.Join(openCodeDataDir(home), "opencode.db"),
 		StateDir:    filepath.Join(home, ".local", "state", "hivewire"),
 	}
+}
+
+func openCodeDataDir(home string) string {
+	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
+		return filepath.Join(dir, "opencode")
+	}
+	return filepath.Join(home, ".local", "share", "opencode")
 }
 
 // Path returns the default config file location.
@@ -87,6 +96,7 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&cfg.IdleDoneSec, "idle-done-sec", cfg.IdleDoneSec, "seconds of silence before an agent is assumed finished")
 	fs.StringVar(&cfg.ClaudeRoot, "claude-root", cfg.ClaudeRoot, "Claude Code projects directory")
 	fs.StringVar(&cfg.CodexRoot, "codex-root", cfg.CodexRoot, "Codex sessions directory")
+	fs.StringVar(&cfg.OpenCodeDB, "opencode-db", cfg.OpenCodeDB, "OpenCode SQLite database")
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "directory for history index and layout")
 	fs.StringVar(&cfg.LogFile, "log-file", cfg.LogFile, "write logs here instead of stderr (required with --tui)")
 	fs.String("config", cfgPath, "path to config.toml")
