@@ -25,16 +25,18 @@ type Provider struct {
 }
 
 type agentTail struct {
-	agent          model.Agent
-	state          map[string]emittedPart
-	roles          map[string]string
-	authority      messageAuthority
-	messageWatch   rowWatch
-	messageWatches map[string]string
-	partWatches    map[string]string
-	message        rowCursor
-	part           rowCursor
-	backlogTools   int
+	agent                 model.Agent
+	state                 map[string]emittedPart
+	roles                 map[string]string
+	authority             messageAuthority
+	messageWatches        map[string]string
+	partWatches           map[string]string
+	message               rowCursor
+	part                  rowCursor
+	backlogTools          int
+	dormant               bool
+	dormantSince          int64
+	dormantSessionUpdated int64
 }
 
 type messageAuthority struct {
@@ -78,7 +80,13 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			}
 			return pollRequest{updatedSince: p.since.UnixMilli()}
 		}
-		return pollRequest{messages: at.message, parts: at.part, messageWatch: at.messageWatch, messageWatches: at.messageWatches, partWatches: at.partWatches}
+		if at.dormant {
+			if session.timeUpdated <= at.dormantSessionUpdated {
+				return pollRequest{skip: true}
+			}
+			return pollRequest{updatedSince: at.dormantSince + 1}
+		}
+		return pollRequest{messages: at.message, parts: at.part, messageWatches: at.messageWatches, partWatches: at.partWatches}
 	})
 	if err != nil {
 		return nil, err
@@ -91,14 +99,28 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			return nil, err
 		}
 	}
+	if snapshot.present {
+		seen := make(map[string]bool, len(snapshot.sessions))
+		for _, session := range snapshot.sessions {
+			seen[Name+":"+session.id] = true
+		}
+		for id := range p.agents {
+			if !seen[id] {
+				delete(p.agents, id)
+			}
+		}
+	}
 
 	var updates []provider.Update
 	for _, session := range snapshot.sessions {
 		id := Name + ":" + session.id
 		at, exists := p.agents[id]
+		if exists {
+			pruneMissingRows(at, snapshot.missingMessages[session.id], snapshot.missingParts[session.id])
+		}
 		changedMessages := snapshot.messages[session.id]
 		changedParts := snapshot.parts[session.id]
-		if exists && at.agent.Backlog && len(changedMessages) == 0 && len(changedParts) == 0 {
+		if exists && (at.agent.Backlog || at.dormant) && len(changedMessages) == 0 && len(changedParts) == 0 {
 			continue
 		}
 		if exists && !at.agent.Backlog && len(changedMessages) == 0 && len(changedParts) == 0 {
@@ -116,6 +138,9 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			updated.DurationMS = agentDuration(updated)
 			if updated != at.agent || len(events) > 0 {
 				at.agent = updated
+				if updated.Status == model.StatusDone || updated.Status == model.StatusError {
+					at.makeDormant(updated.Updated.UnixMilli(), session.timeUpdated)
+				}
 				updates = append(updates, provider.Update{Agent: updated, Events: events})
 			}
 			continue
@@ -129,6 +154,10 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			messages = messagesCreatedSince(changedMessages, p.since.UnixMilli())
 			parts = partsCreatedSince(changedParts, p.since.UnixMilli())
 			messages = appendRoleContext(at.roles, messages, parts)
+		}
+		if exists && at.dormant {
+			messages = messagesAfterCutoff(changedMessages, at.dormantSince)
+			parts = partsAfterCutoff(changedParts, at.dormantSince)
 		}
 		if exists && !at.agent.Backlog {
 			messages = appendRoleContext(at.roles, messages, parts)
@@ -146,6 +175,9 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 		backlog := !exists && activity.Before(p.since)
 		if exists && at.agent.Backlog {
 			backlog = activity.Before(p.since)
+		}
+		if exists && at.dormant {
+			backlog = false
 		}
 
 		normalized, err := normalizeSessionMode(
@@ -224,6 +256,7 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			at.message = rowCursor{}
 			at.part = rowCursor{}
 		} else {
+			at.dormant = false
 			if at.roles == nil {
 				at.roles = make(map[string]string)
 			}
@@ -232,15 +265,67 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			at.state = mergeEmissionState(at.state, normalized.state)
 			at.message = advanceMessageCursor(at.message, changedMessages, nil)
 			at.part = advancePartCursor(at.part, changedParts, at.state)
-			at.messageWatch = authorityWatch(at.messageWatch, at.authority, changedMessages)
-			at.messageWatches = malformedMessageWatches(at.messageWatches, changedMessages, at.state)
+			at.messageWatches = malformedMessageWatches(at.messageWatches, changedMessages, at.state, at.authority.id)
+			at.messageWatches = authorityWatches(at.messageWatches, at.authority, changedMessages)
 			at.partWatches = unresolvedPartWatches(at.partWatches, changedParts, at.state, at.roles)
+			if at.agent.Status == model.StatusDone || at.agent.Status == model.StatusError {
+				at.makeDormant(at.agent.Updated.UnixMilli(), session.timeUpdated)
+			}
 		}
 		if changed {
 			updates = append(updates, provider.Update{Agent: at.agent, Events: events})
 		}
 	}
 	return updates, nil
+}
+
+func (at *agentTail) makeDormant(cutoff, sessionUpdated int64) {
+	at.dormant = true
+	at.dormantSince = cutoff
+	at.dormantSessionUpdated = sessionUpdated
+	at.state = nil
+	at.roles = nil
+	at.authority = messageAuthority{}
+	at.messageWatches = nil
+	at.partWatches = nil
+	at.message = rowCursor{}
+	at.part = rowCursor{}
+}
+
+func pruneMissingRows(at *agentTail, messages, parts []string) {
+	for _, id := range messages {
+		delete(at.messageWatches, id)
+		delete(at.roles, id)
+		delete(at.state, id)
+		if at.authority.id == id {
+			at.authority = messageAuthority{}
+			at.agent.Status = model.StatusLive
+		}
+	}
+	for _, id := range parts {
+		delete(at.partWatches, id)
+		delete(at.state, id)
+	}
+}
+
+func messagesAfterCutoff(rows []messageRow, cutoff int64) []messageRow {
+	result := make([]messageRow, 0, len(rows))
+	for _, row := range rows {
+		if row.timeCreated > cutoff || row.timeUpdated > cutoff {
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func partsAfterCutoff(rows []partRow, cutoff int64) []partRow {
+	result := make([]partRow, 0, len(rows))
+	for _, row := range rows {
+		if row.timeCreated > cutoff || row.timeUpdated > cutoff {
+			result = append(result, row)
+		}
+	}
+	return result
 }
 
 func countNewToolUses(events []model.Event) int {
@@ -366,19 +451,20 @@ func updateAuthority(current messageAuthority, rows []messageRow) messageAuthori
 	return current
 }
 
-func authorityWatch(prior rowWatch, authority messageAuthority, rows []messageRow) rowWatch {
+func authorityWatches(watches map[string]string, authority messageAuthority, rows []messageRow) map[string]string {
+	if watches == nil {
+		watches = make(map[string]string)
+	}
 	if authority.id == "" {
-		return rowWatch{}
+		return watches
 	}
 	for _, row := range rows {
 		if row.id == authority.id {
-			return rowWatch{id: row.id, fingerprint: rowFingerprint(row.data)}
+			watches[row.id] = rowFingerprint(row.data)
+			return watches
 		}
 	}
-	if prior.id == authority.id {
-		return prior
-	}
-	return rowWatch{id: authority.id}
+	return watches
 }
 
 func unresolvedPartWatches(watches map[string]string, rows []partRow, state map[string]emittedPart, roles map[string]string) map[string]string {
@@ -396,9 +482,14 @@ func unresolvedPartWatches(watches map[string]string, rows []partRow, state map[
 	return watches
 }
 
-func malformedMessageWatches(watches map[string]string, rows []messageRow, state map[string]emittedPart) map[string]string {
+func malformedMessageWatches(watches map[string]string, rows []messageRow, state map[string]emittedPart, authorityID string) map[string]string {
 	if watches == nil {
 		watches = make(map[string]string)
+	}
+	for id := range watches {
+		if id != authorityID && state[id].malformed == "" {
+			delete(watches, id)
+		}
 	}
 	for _, row := range rows {
 		var data messageData

@@ -31,9 +31,12 @@ type partRow struct {
 }
 
 type dbSnapshot struct {
-	sessions []sessionRow
-	messages map[string][]messageRow
-	parts    map[string][]partRow
+	present         bool
+	sessions        []sessionRow
+	messages        map[string][]messageRow
+	parts           map[string][]partRow
+	missingMessages map[string][]string
+	missingParts    map[string][]string
 }
 
 type database struct {
@@ -44,12 +47,15 @@ type database struct {
 }
 
 type pollStats struct {
-	messageRows  int
-	partRows     int
-	maxQueryArgs int
-	queryCount   int
-	watchQueries int
+	messageRows     int
+	partRows        int
+	maxQueryArgs    int
+	queryCount      int
+	watchQueries    int
+	maxWatchPayload int
 }
+
+const maxWatchPayloadBytes = 64 * 1024
 
 type rowCursor struct {
 	updated  int64
@@ -61,14 +67,8 @@ type pollRequest struct {
 	updatedSince   int64
 	messages       rowCursor
 	parts          rowCursor
-	messageWatch   rowWatch
 	messageWatches map[string]string
 	partWatches    map[string]string
-}
-
-type rowWatch struct {
-	id          string
-	fingerprint string
 }
 
 func newDatabase(path string) *database {
@@ -84,6 +84,7 @@ func (d *database) snapshot(ctx context.Context) (result dbSnapshot, retErr erro
 	if err != nil || !exists {
 		return result, err
 	}
+	result.present = true
 	defer func() {
 		if err := db.Close(); retErr == nil && err != nil {
 			retErr = err
@@ -122,7 +123,10 @@ func (d *database) snapshot(ctx context.Context) (result dbSnapshot, retErr erro
 func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) pollRequest) (result dbSnapshot, retErr error) {
 	d.lastPoll = pollStats{}
 	d.replaced = false
-	result = dbSnapshot{messages: make(map[string][]messageRow), parts: make(map[string][]partRow)}
+	result = dbSnapshot{
+		messages: make(map[string][]messageRow), parts: make(map[string][]partRow),
+		missingMessages: make(map[string][]string), missingParts: make(map[string][]string),
+	}
 	info, err := os.Stat(d.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return result, nil
@@ -138,6 +142,7 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 	if err != nil || !exists {
 		return result, err
 	}
+	result.present = true
 	defer func() {
 		if err := db.Close(); retErr == nil && err != nil {
 			retErr = err
@@ -149,6 +154,7 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 	}
 	defer tx.Rollback()
 	result.sessions, err = querySessions(ctx, tx)
+	d.lastPoll.queryCount++
 	if err != nil {
 		return dbSnapshot{}, err
 	}
@@ -174,21 +180,8 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		if err != nil {
 			return dbSnapshot{}, err
 		}
-		if req.messageWatch.id != "" && !hasMessage(result.messages[session.id], req.messageWatch.id) {
-			row, ok, err := queryMessageWatch(ctx, tx, session.id, req.messageWatch)
-			d.lastPoll.queryCount++
-			d.lastPoll.watchQueries++
-			if err != nil {
-				return dbSnapshot{}, err
-			}
-			if ok {
-				result.messages[session.id] = append(result.messages[session.id], row)
-			}
-		}
 		if len(req.messageWatches) > 0 {
-			rows, err := queryMessageWatches(ctx, tx, session.id, req.messageWatches)
-			d.lastPoll.queryCount++
-			d.lastPoll.watchQueries++
+			rows, missing, err := d.queryMessageWatches(ctx, tx, session.id, req.messageWatches)
 			if err != nil {
 				return dbSnapshot{}, err
 			}
@@ -197,11 +190,10 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 					result.messages[session.id] = append(result.messages[session.id], row)
 				}
 			}
+			result.missingMessages[session.id] = append(result.missingMessages[session.id], missing...)
 		}
 		if len(req.partWatches) > 0 {
-			rows, err := queryPartWatches(ctx, tx, session.id, req.partWatches)
-			d.lastPoll.queryCount++
-			d.lastPoll.watchQueries++
+			rows, missing, err := d.queryPartWatches(ctx, tx, session.id, req.partWatches)
 			if err != nil {
 				return dbSnapshot{}, err
 			}
@@ -210,6 +202,7 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 					result.parts[session.id] = append(result.parts[session.id], row)
 				}
 			}
+			result.missingParts[session.id] = append(result.missingParts[session.id], missing...)
 		}
 		d.lastPoll.messageRows += len(result.messages[session.id])
 		d.lastPoll.partRows += len(result.parts[session.id])
@@ -220,66 +213,113 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 	return result, nil
 }
 
-func queryMessageWatch(ctx context.Context, tx *sql.Tx, sessionID string, watch rowWatch) (messageRow, bool, error) {
-	var row messageRow
-	err := tx.QueryRowContext(ctx, `SELECT id,session_id,time_created,time_updated,data FROM message WHERE session_id = ? AND id = ?`, sessionID, watch.id).
-		Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return messageRow{}, false, nil
-	}
-	return row, err == nil && rowFingerprint(row.data) != watch.fingerprint, err
-}
-
-func queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]partRow, error) {
-	raw, err := json.Marshal(watches)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT p.id,p.message_id,p.session_id,p.time_created,p.time_updated,p.data,w.value
+func (d *database) queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]partRow, []string, error) {
+	var result []partRow
+	existing := make(map[string]bool)
+	for _, batch := range watchBatches(watches) {
+		raw, err := json.Marshal(batch)
+		if err != nil {
+			return nil, nil, err
+		}
+		d.recordWatchQuery(len(raw))
+		rows, err := tx.QueryContext(ctx, `SELECT p.id,p.message_id,p.session_id,p.time_created,p.time_updated,p.data,w.value
 		FROM part p JOIN json_each(?) w ON w.key = p.id
 		WHERE p.session_id = ?`, string(raw), sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []partRow
-	for rows.Next() {
-		var row partRow
-		var fingerprint string
-		if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
-			return nil, err
+		if err != nil {
+			return nil, nil, err
 		}
-		if rowFingerprint(row.data) != fingerprint {
-			result = append(result, row)
+		for rows.Next() {
+			var row partRow
+			var fingerprint string
+			if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			existing[row.id] = true
+			if rowFingerprint(row.data) != fingerprint {
+				result = append(result, row)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, nil, err
 		}
 	}
-	return result, rows.Err()
+	return result, missingWatchIDs(watches, existing), nil
 }
 
-func queryMessageWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]messageRow, error) {
-	raw, err := json.Marshal(watches)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT m.id,m.session_id,m.time_created,m.time_updated,m.data,w.value
+func (d *database) queryMessageWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]messageRow, []string, error) {
+	var result []messageRow
+	existing := make(map[string]bool)
+	for _, batch := range watchBatches(watches) {
+		raw, err := json.Marshal(batch)
+		if err != nil {
+			return nil, nil, err
+		}
+		d.recordWatchQuery(len(raw))
+		rows, err := tx.QueryContext(ctx, `SELECT m.id,m.session_id,m.time_created,m.time_updated,m.data,w.value
 		FROM message m JOIN json_each(?) w ON w.key = m.id
 		WHERE m.session_id = ?`, string(raw), sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []messageRow
-	for rows.Next() {
-		var row messageRow
-		var fingerprint string
-		if err := rows.Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
-			return nil, err
+		if err != nil {
+			return nil, nil, err
 		}
-		if rowFingerprint(row.data) != fingerprint {
-			result = append(result, row)
+		for rows.Next() {
+			var row messageRow
+			var fingerprint string
+			if err := rows.Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			existing[row.id] = true
+			if rowFingerprint(row.data) != fingerprint {
+				result = append(result, row)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, nil, err
 		}
 	}
-	return result, rows.Err()
+	return result, missingWatchIDs(watches, existing), nil
+}
+
+func (d *database) recordWatchQuery(payload int) {
+	d.lastPoll.queryCount++
+	d.lastPoll.watchQueries++
+	if payload > d.lastPoll.maxWatchPayload {
+		d.lastPoll.maxWatchPayload = payload
+	}
+	if d.lastPoll.maxQueryArgs < 2 {
+		d.lastPoll.maxQueryArgs = 2
+	}
+}
+
+func watchBatches(watches map[string]string) []map[string]string {
+	var batches []map[string]string
+	batch := make(map[string]string)
+	size := 2
+	for id, fingerprint := range watches {
+		entrySize := len(id) + len(fingerprint) + 6
+		if len(batch) > 0 && size+entrySize > maxWatchPayloadBytes {
+			batches = append(batches, batch)
+			batch = make(map[string]string)
+			size = 2
+		}
+		batch[id] = fingerprint
+		size += entrySize
+	}
+	if len(batch) > 0 {
+		batches = append(batches, batch)
+	}
+	return batches
+}
+
+func missingWatchIDs(watches map[string]string, existing map[string]bool) []string {
+	var result []string
+	for id := range watches {
+		if !existing[id] {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 func hasMessage(rows []messageRow, id string) bool {

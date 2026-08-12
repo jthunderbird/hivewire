@@ -1028,6 +1028,9 @@ func TestPollStreamsMutablePhasesAndLifecycleOnce(t *testing.T) {
 
 	insertMessage(t, db, "child", "resumed-user", base+200, base+200, `{"role":"user"}`)
 	insertPart(t, db, "child", "resumed-user", "resumed-text", base+200, base+200, `{"type":"text","text":"continue"}`)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+200); err != nil {
+		t.Fatal(err)
+	}
 	resumed, err := p.Poll()
 	if err != nil || len(resumed) != 1 {
 		t.Fatalf("resumed poll = %+v, %v", resumed, err)
@@ -1407,7 +1410,6 @@ func TestLargeBacklogPollIsEventlessAndBounded(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-
 	done := make(chan struct {
 		updates []provider.Update
 		err     error
@@ -1582,6 +1584,12 @@ func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T)
 	if len(idle) != 1 || idle[0].Agent.Status != model.StatusDone || !reflect.DeepEqual(normalizedKinds(idle[0].Events), []model.EventKind{model.EvStatus}) {
 		t.Fatalf("idle transition = %+v", idle)
 	}
+	if !p.agents[Name+":child"].dormant {
+		t.Fatal("idle terminal agent did not become dormant")
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
+		t.Fatalf("idle terminal follow-up = %+v, stats=%+v, err=%v", updates, p.db.lastPoll, err)
+	}
 }
 
 func TestIncrementalStateAndSQLStayBoundedAfterLargeLiveHistory(t *testing.T) {
@@ -1604,6 +1612,9 @@ func TestIncrementalStateAndSQLStayBoundedAfterLargeLiveHistory(t *testing.T) {
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE message SET data='{"role":"assistant"}' WHERE id='message-2999'`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1848,7 +1859,7 @@ func TestNonAuthoritativeMalformedMessageRecoversAfterCursorAdvance(t *testing.T
 		t.Fatalf("initial malformed message = %+v, %v", first, err)
 	}
 	at := p.agents[Name+":child"]
-	if len(at.messageWatches) != 1 || at.messageWatches["older-bad"] == "" {
+	if len(at.messageWatches) != 2 || at.messageWatches["older-bad"] == "" || at.messageWatches["newer"] == "" {
 		t.Fatalf("malformed message watches = %+v", at.messageWatches)
 	}
 	if _, err := db.Exec(`UPDATE message SET data=? WHERE id='older-bad'`, `{"role":"user","agent":"recovered-agent"}`); err != nil {
@@ -1861,8 +1872,198 @@ func TestNonAuthoritativeMalformedMessageRecoversAfterCursorAdvance(t *testing.T
 	if len(updates) != 0 || p.lastNormalized.messageRows != 1 || at.roles["older-bad"] != "user" {
 		t.Fatalf("non-authoritative recovery = %+v normalized=%+v roles=%+v", updates, p.lastNormalized, at.roles)
 	}
-	if len(at.messageWatches) != 0 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
+	if len(at.messageWatches) != 1 || at.messageWatches["older-bad"] != "" || at.messageWatches["newer"] == "" || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
 		t.Fatalf("message recovery watches/stats = %+v / %+v", at.messageWatches, p.db.lastPoll)
+	}
+}
+
+func TestTerminalAgentsBecomeDormantAndReleaseRowState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1000; i++ {
+		sessionID := fmt.Sprintf("child-%04d", i)
+		messageID := fmt.Sprintf("message-%04d", i)
+		partID := fmt.Sprintf("part-%04d", i)
+		if _, err := tx.Exec(`INSERT INTO session (id,project_id,parent_id,directory,title,version,time_created,time_updated) VALUES (?,?,?,?,?,?,?,?)`, sessionID, "project", "parent", "/work", sessionID, "1", base, base+2); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO message VALUES (?,?,?,?,?)`, messageID, sessionID, base+1, base+2, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+2)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO part VALUES (?,?,?,?,?,?)`, partID, messageID, sessionID, base+1, base+1, `{"type":"text","text":"done","time":{"end":1}}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	for id, at := range p.agents {
+		if !at.dormant || at.dormantSince != base+2 || at.dormantSessionUpdated != base+2 {
+			t.Fatalf("%s not dormant at terminal cutoff: %+v", id, at)
+		}
+		if len(at.state) != 0 || len(at.roles) != 0 || len(at.messageWatches) != 0 || len(at.partWatches) != 0 || at.authority.id != "" {
+			t.Fatalf("%s retained terminal row state: %+v", id, at)
+		}
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("terminal idle poll = %+v, %v", updates, err)
+	}
+	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 || p.db.lastPoll.watchQueries != 0 {
+		t.Fatalf("terminal idle queries = %+v", p.db.lastPoll)
+	}
+}
+
+func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "done", base+1, base+2, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+2))
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+2); err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "resume", base+3, base+3, `{"role":"user"}`)
+	insertPart(t, db, "child", "resume", "resume-part", base+3, base+3, `{"type":"text","text":"continue"}`)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+3); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 || updates[0].Agent.Status != model.StatusLive || updates[0].Agent.Backlog || !reflect.DeepEqual(normalizedKinds(updates[0].Events), []model.EventKind{model.EvUser, model.EvStatus}) {
+		t.Fatalf("dormant resume = %+v", updates)
+	}
+	if p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 || p.agents[Name+":child"].dormant {
+		t.Fatalf("dormant resume state/stats = %+v / %+v", p.agents[Name+":child"], p.db.lastPoll)
+	}
+}
+
+func TestDeletedSessionsAreRemovedFromProviderState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM session WHERE id='child'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.agents[Name+":child"]; ok {
+		t.Fatal("deleted session remained in provider state")
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.watchQueries != 0 {
+		t.Fatalf("deleted session query overhead = %+v", p.db.lastPoll)
+	}
+}
+
+func TestMissingDatabaseDoesNotPurgeProviderState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	missingPath := filepath.Join(dir, "temporarily-missing.db")
+	if err := os.Rename(path, missingPath); err != nil {
+		t.Fatal(err)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("missing poll = %+v, %v", updates, err)
+	}
+	if _, ok := p.agents[Name+":child"]; !ok {
+		t.Fatal("transiently missing database purged provider state")
+	}
+}
+
+func TestDeletedWatchedRowsArePruned(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base+1, base+1, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "assistant", "running", base+2, base+2, `{"type":"tool","tool":"bash","state":{"status":"running","input":{}}}`)
+	insertMessage(t, db, "child", "bad-message", base+10, base+10, `{"role":42}`)
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.messageWatches) != 1 || len(at.partWatches) != 1 {
+		t.Fatalf("initial watches = %+v / %+v", at.messageWatches, at.partWatches)
+	}
+	if _, err := db.Exec(`DELETE FROM message WHERE id='bad-message'; DELETE FROM part WHERE id='running'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if len(at.messageWatches) != 0 || len(at.partWatches) != 0 {
+		t.Fatalf("deleted watches retained = %+v / %+v", at.messageWatches, at.partWatches)
+	}
+	if at.authority.id != "" || at.agent.Status != model.StatusLive {
+		t.Fatalf("deleted malformed authority remained stale: authority=%+v agent=%+v", at.authority, at.agent)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.watchQueries != 0 {
+		t.Fatalf("stale deleted watches still queried: %+v", p.db.lastPoll)
+	}
+}
+
+func TestWatchPayloadIsBatchedAtReasonableCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		if _, err := tx.Exec(`INSERT INTO part VALUES (?,?,?,?,?,?)`, fmt.Sprintf("running-%04d", i), "assistant", "child", base, base, `{"type":"tool","tool":"bash","state":{"status":"running","input":{}}}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.maxWatchPayload > maxWatchPayloadBytes || p.db.lastPoll.maxQueryArgs > 2 || p.db.lastPoll.watchQueries > 20 {
+		t.Fatalf("watch batching stats = %+v", p.db.lastPoll)
 	}
 }
 
