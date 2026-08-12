@@ -58,7 +58,7 @@ func fixtureDB(t *testing.T, path string) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dsn := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
+	dsn := sqliteFileURL(abs)
 	db, err := sql.Open("sqlite", dsn.String())
 	if err != nil {
 		t.Fatal(err)
@@ -76,6 +76,36 @@ func insertSession(t *testing.T, db *sql.DB, id, parent string, created int64) {
 		id,project_id,parent_id,directory,title,version,agent,model,time_created,time_updated
 	) VALUES (?,?,?,?,?,?,?,?,?,?)`, id, "project", parent, "/work", id, "1.15.7", "build", "gpt-5", created, created+1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSQLiteFileURI(t *testing.T) {
+	tests := []struct {
+		name, path, prefix string
+	}{
+		{"POSIX", "/tmp/OpenCode #1?.db", "file:///tmp/OpenCode%20%231%3F.db?"},
+		{"Windows drive", `C:\Users\Alice\OpenCode #1?.db`, "file:///C:/Users/Alice/OpenCode%20%231%3F.db?"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sqliteFileURI(tt.path)
+			if !strings.HasPrefix(got, tt.prefix) {
+				t.Fatalf("sqliteFileURI(%q) = %q, want prefix %q", tt.path, got, tt.prefix)
+			}
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Scheme != "file" || u.Host != "" {
+				t.Fatalf("URI scheme/host = %q/%q, want file with no authority", u.Scheme, u.Host)
+			}
+			if u.Query().Get("mode") != "ro" {
+				t.Fatalf("mode = %q, want ro", u.Query().Get("mode"))
+			}
+			if got := u.Query()["_pragma"]; !reflect.DeepEqual(got, []string{"query_only(1)", "busy_timeout(50)"}) {
+				t.Fatalf("pragmas = %v", got)
+			}
+		})
 	}
 }
 
@@ -135,7 +165,6 @@ func TestSnapshotReadsChildRowsInStableOrder(t *testing.T) {
 	}
 
 	db := newDatabase(path)
-	t.Cleanup(db.clear)
 	snap, err := db.snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -154,11 +183,32 @@ func TestSnapshotReadsChildRowsInStableOrder(t *testing.T) {
 	}
 }
 
+func TestSnapshotReleasesDatabaseForRenameAndDelete(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opencode.db")
+	w := fixtureDB(t, path)
+	insertSession(t, w, "child", "parent", 1)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := newDatabase(path)
+	if _, err := db.snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(dir, "old.db")
+	if err := os.Rename(path, oldPath); err != nil {
+		t.Fatalf("rename after snapshot: %v", err)
+	}
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatalf("delete after snapshot: %v", err)
+	}
+}
+
 func TestMissingDatabaseIsNoOpWithoutArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing # database?.db")
 	db := newDatabase(path)
-	t.Cleanup(db.clear)
 
 	snap, err := db.snapshot(context.Background())
 	if err != nil {
@@ -183,24 +233,28 @@ func TestNonWALSnapshotCannotWriteOrCreateSidecars(t *testing.T) {
 	insertSession(t, w, "child", "parent", 1)
 
 	db := newDatabase(path)
-	t.Cleanup(db.clear)
 	if _, err := db.snapshot(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	handle, exists, err := openDatabase(context.Background(), path)
+	if err != nil || !exists {
+		t.Fatalf("open = %v, %v", exists, err)
+	}
+	defer handle.Close()
 	var queryOnly, busyTimeout int
-	if err := db.db.QueryRow(`PRAGMA query_only`).Scan(&queryOnly); err != nil {
+	if err := handle.QueryRow(`PRAGMA query_only`).Scan(&queryOnly); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+	if err := handle.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
 		t.Fatal(err)
 	}
 	if queryOnly != 1 || busyTimeout != 50 {
 		t.Fatalf("connection pragmas query_only=%d busy_timeout=%d", queryOnly, busyTimeout)
 	}
-	if max := db.db.Stats().MaxOpenConnections; max != 1 {
+	if max := handle.Stats().MaxOpenConnections; max != 1 {
 		t.Fatalf("MaxOpenConnections = %d, want 1", max)
 	}
-	if _, err := db.db.Exec(`INSERT INTO session (
+	if _, err := handle.Exec(`INSERT INTO session (
 		id,project_id,parent_id,directory,title,version,time_created,time_updated
 	) VALUES ('written','project','parent','/work','bad','1',1,1)`); err == nil {
 		t.Fatal("read-only connection accepted a write")
@@ -235,7 +289,6 @@ func TestActiveWALSnapshotSeesCommittedRowsWithoutLogicalWrites(t *testing.T) {
 	insertSession(t, w, "child", "parent", 1)
 
 	db := newDatabase(path)
-	t.Cleanup(db.clear)
 	first, err := db.snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +307,12 @@ func TestActiveWALSnapshotSeesCommittedRowsWithoutLogicalWrites(t *testing.T) {
 	if got := messageIDs(second.messages["child"]); got != "committed" {
 		t.Fatalf("committed WAL messages = %q", got)
 	}
-	if _, err := db.db.Exec(`DELETE FROM message`); err == nil {
+	handle, exists, err := openDatabase(context.Background(), path)
+	if err != nil || !exists {
+		t.Fatalf("open = %v, %v", exists, err)
+	}
+	defer handle.Close()
+	if _, err := handle.Exec(`DELETE FROM message`); err == nil {
 		t.Fatal("WAL reader accepted a logical write")
 	}
 	var count int
@@ -284,8 +342,8 @@ func TestIncompatibleSchemaReturnsErrorAndClearsConnection(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "parent_id") {
 		t.Fatalf("incompatible schema error = %v", err)
 	}
-	if db.db != nil || db.info != nil {
-		t.Fatal("database connection retained after schema error")
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove incompatible database after snapshot error: %v", err)
 	}
 }
 
@@ -294,19 +352,30 @@ func TestReplacedDatabaseIsReopened(t *testing.T) {
 	path := filepath.Join(dir, "opencode.db")
 	w := fixtureDB(t, path)
 	insertSession(t, w, "old", "parent", 1)
-	db := newDatabase(path)
-	t.Cleanup(db.clear)
-	if snap, err := db.snapshot(context.Background()); err != nil || rowIDs(snap.sessions) != "old" {
-		t.Fatalf("initial snapshot = %q, %v", rowIDs(snap.sessions), err)
-	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(path, filepath.Join(dir, "old.db")); err != nil {
+	replacementPath := filepath.Join(dir, "replacement.db")
+	replacement := fixtureDB(t, replacementPath)
+	insertSession(t, replacement, "new", "parent", 2)
+	if err := replacement.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replacement := fixtureDB(t, path)
-	insertSession(t, replacement, "new", "parent", 2)
+
+	db := newDatabase(path)
+	if snap, err := db.snapshot(context.Background()); err != nil || rowIDs(snap.sessions) != "old" {
+		t.Fatalf("initial snapshot = %q, %v", rowIDs(snap.sessions), err)
+	}
+	oldPath := filepath.Join(dir, "old.db")
+	if err := os.Rename(path, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacementPath, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
 
 	snap, err := db.snapshot(context.Background())
 	if err != nil {
@@ -332,11 +401,12 @@ func TestQueryHelpersShareOneTransactionSnapshot(t *testing.T) {
 	}
 
 	db := newDatabase(path)
-	t.Cleanup(db.clear)
-	if exists, err := db.open(context.Background()); err != nil || !exists {
+	handle, exists, err := openDatabase(context.Background(), path)
+	if err != nil || !exists {
 		t.Fatalf("open = %v, %v", exists, err)
 	}
-	tx, err := db.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	defer handle.Close()
+	tx, err := handle.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +455,7 @@ func TestQueryHelpersShareOneTransactionSnapshot(t *testing.T) {
 	}
 }
 
-func TestMissingDatabaseClearsExistingConnection(t *testing.T) {
+func TestMissingDatabaseAfterRemovalIsNoOp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	w := fixtureDB(t, path)
 	insertSession(t, w, "child", "parent", 1)
@@ -401,9 +471,6 @@ func TestMissingDatabaseClearsExistingConnection(t *testing.T) {
 	}
 	if _, err := db.snapshot(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if db.db != nil || db.info != nil {
-		t.Fatal("connection retained after path disappeared")
 	}
 }
 

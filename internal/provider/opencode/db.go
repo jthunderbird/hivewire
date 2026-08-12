@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -36,27 +37,29 @@ type dbSnapshot struct {
 
 type database struct {
 	path string
-	db   *sql.DB
-	info os.FileInfo
 }
 
 func newDatabase(path string) *database {
 	return &database{path: path}
 }
 
-func (d *database) snapshot(ctx context.Context) (dbSnapshot, error) {
-	result := dbSnapshot{
+func (d *database) snapshot(ctx context.Context) (result dbSnapshot, retErr error) {
+	result = dbSnapshot{
 		messages: make(map[string][]messageRow),
 		parts:    make(map[string][]partRow),
 	}
-	exists, err := d.open(ctx)
+	db, exists, err := openDatabase(ctx, d.path)
 	if err != nil || !exists {
 		return result, err
 	}
+	defer func() {
+		if err := db.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
 
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		d.clear()
 		return result, err
 	}
 	defer tx.Rollback()
@@ -75,65 +78,58 @@ func (d *database) snapshot(ctx context.Context) (dbSnapshot, error) {
 		}
 	}
 	if err != nil {
-		d.clear()
 		return dbSnapshot{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		d.clear()
 		return dbSnapshot{}, err
 	}
 	return result, nil
 }
 
-func (d *database) open(ctx context.Context) (bool, error) {
-	info, err := os.Stat(d.path)
+func openDatabase(ctx context.Context, path string) (*sql.DB, bool, error) {
+	_, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		d.clear()
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		d.clear()
-		return false, err
-	}
-	if d.db != nil {
-		if d.info != nil && os.SameFile(d.info, info) {
-			return true, nil
-		}
-		d.clear()
+		return nil, false, err
 	}
 
-	abs, err := filepath.Abs(d.path)
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}
-	q := u.Query()
-	q.Set("mode", "ro")
-	q.Add("_pragma", "query_only(1)")
-	q.Add("_pragma", "busy_timeout(50)")
-	u.RawQuery = q.Encode()
+	u := sqliteFileURI(abs)
 
-	db, err := sql.Open("sqlite", u.String())
+	db, err := sql.Open("sqlite", u)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
-		return false, err
+		return nil, false, err
 	}
-	d.db = db
-	d.info = info
-	return true, nil
+	return db, true, nil
 }
 
-func (d *database) clear() {
-	if d.db != nil {
-		d.db.Close()
+func sqliteFileURI(path string) string {
+	u := sqliteFileURL(path)
+	q := u.Query()
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(1)")
+	q.Add("_pragma", "busy_timeout(50)")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func sqliteFileURL(path string) url.URL {
+	path = strings.ReplaceAll(path, `\`, "/")
+	if len(path) >= 2 && path[1] == ':' {
+		path = "/" + path
 	}
-	d.db = nil
-	d.info = nil
+	return url.URL{Scheme: "file", Path: path}
 }
 
 func querySessions(ctx context.Context, tx *sql.Tx) ([]sessionRow, error) {
