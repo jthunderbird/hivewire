@@ -57,12 +57,13 @@ type rowCursor struct {
 }
 
 type pollRequest struct {
-	skip         bool
-	updatedSince int64
-	messages     rowCursor
-	parts        rowCursor
-	messageWatch rowWatch
-	partWatches  map[string]string
+	skip           bool
+	updatedSince   int64
+	messages       rowCursor
+	parts          rowCursor
+	messageWatch   rowWatch
+	messageWatches map[string]string
+	partWatches    map[string]string
 }
 
 type rowWatch struct {
@@ -184,6 +185,19 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 				result.messages[session.id] = append(result.messages[session.id], row)
 			}
 		}
+		if len(req.messageWatches) > 0 {
+			rows, err := queryMessageWatches(ctx, tx, session.id, req.messageWatches)
+			d.lastPoll.queryCount++
+			d.lastPoll.watchQueries++
+			if err != nil {
+				return dbSnapshot{}, err
+			}
+			for _, row := range rows {
+				if !hasMessage(result.messages[session.id], row.id) {
+					result.messages[session.id] = append(result.messages[session.id], row)
+				}
+			}
+		}
 		if len(req.partWatches) > 0 {
 			rows, err := queryPartWatches(ctx, tx, session.id, req.partWatches)
 			d.lastPoll.queryCount++
@@ -233,6 +247,32 @@ func queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches
 		var row partRow
 		var fingerprint string
 		if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
+			return nil, err
+		}
+		if rowFingerprint(row.data) != fingerprint {
+			result = append(result, row)
+		}
+	}
+	return result, rows.Err()
+}
+
+func queryMessageWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]messageRow, error) {
+	raw, err := json.Marshal(watches)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT m.id,m.session_id,m.time_created,m.time_updated,m.data,w.value
+		FROM message m JOIN json_each(?) w ON w.key = m.id
+		WHERE m.session_id = ?`, string(raw), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []messageRow
+	for rows.Next() {
+		var row messageRow
+		var fingerprint string
+		if err := rows.Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
 			return nil, err
 		}
 		if rowFingerprint(row.data) != fingerprint {

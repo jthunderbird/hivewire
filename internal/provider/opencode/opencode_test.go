@@ -1776,6 +1776,96 @@ func TestPartOnlyDeltaPreservesResolvedNameAndNormalizedTitle(t *testing.T) {
 	}
 }
 
+func TestOlderMalformedPartRecoversAfterHighWaterAdvance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "assistant", "malformed", base+1, base+1, `{"type":"text","text":42}`)
+	insertPart(t, db, "child", "assistant", "newer", base+10, base+10, fmt.Sprintf(`{"type":"text","text":"newer","time":{"end":%d}}`, base+10))
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 || normalizedKinds(first[0].Events)[0] != model.EvNotice {
+		t.Fatalf("initial malformed poll = %+v, %v", first, err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.partWatches) != 1 || at.partWatches["malformed"] == "" {
+		t.Fatalf("malformed part watches = %+v", at.partWatches)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='malformed'`, fmt.Sprintf(`{"type":"text","text":"recovered","time":{"end":%d}}`, base+11)); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 || !reflect.DeepEqual(normalizedKinds(recovered[0].Events), []model.EventKind{model.EvText}) {
+		t.Fatalf("malformed part recovery = %+v", recovered)
+	}
+	if len(at.partWatches) != 0 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("recovery watches/stats = %+v / %+v", at.partWatches, p.db.lastPoll)
+	}
+}
+
+func TestOlderMalformedPartChangeEmitsNewNotice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "assistant", "malformed", base+1, base+1, `{"type":"text","text":42}`)
+	insertPart(t, db, "child", "assistant", "newer", base+10, base+10, fmt.Sprintf(`{"type":"text","text":"newer","time":{"end":%d}}`, base+10))
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='malformed'`, `{"type":"text","text":false}`); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || !reflect.DeepEqual(normalizedKinds(changed[0].Events), []model.EventKind{model.EvNotice}) {
+		t.Fatalf("changed malformed notice = %+v", changed)
+	}
+	if len(p.agents[Name+":child"].partWatches) != 1 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("changed malformed watches/stats = %+v / %+v", p.agents[Name+":child"].partWatches, p.db.lastPoll)
+	}
+}
+
+func TestNonAuthoritativeMalformedMessageRecoversAfterCursorAdvance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "older-bad", base+1, base+1, `{"role":42}`)
+	insertMessage(t, db, "child", "newer", base+10, base+10, `{"role":"assistant"}`)
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 || !reflect.DeepEqual(normalizedKinds(first[0].Events), []model.EventKind{model.EvNotice}) {
+		t.Fatalf("initial malformed message = %+v, %v", first, err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.messageWatches) != 1 || at.messageWatches["older-bad"] == "" {
+		t.Fatalf("malformed message watches = %+v", at.messageWatches)
+	}
+	if _, err := db.Exec(`UPDATE message SET data=? WHERE id='older-bad'`, `{"role":"user","agent":"recovered-agent"}`); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 || p.lastNormalized.messageRows != 1 || at.roles["older-bad"] != "user" {
+		t.Fatalf("non-authoritative recovery = %+v normalized=%+v roles=%+v", updates, p.lastNormalized, at.roles)
+	}
+	if len(at.messageWatches) != 0 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("message recovery watches/stats = %+v / %+v", at.messageWatches, p.db.lastPoll)
+	}
+}
+
 func normalizedKinds(events []model.Event) []model.EventKind {
 	result := make([]model.EventKind, len(events))
 	for i := range events {

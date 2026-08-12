@@ -25,15 +25,16 @@ type Provider struct {
 }
 
 type agentTail struct {
-	agent        model.Agent
-	state        map[string]emittedPart
-	roles        map[string]string
-	authority    messageAuthority
-	messageWatch rowWatch
-	partWatches  map[string]string
-	message      rowCursor
-	part         rowCursor
-	backlogTools int
+	agent          model.Agent
+	state          map[string]emittedPart
+	roles          map[string]string
+	authority      messageAuthority
+	messageWatch   rowWatch
+	messageWatches map[string]string
+	partWatches    map[string]string
+	message        rowCursor
+	part           rowCursor
+	backlogTools   int
 }
 
 type messageAuthority struct {
@@ -77,7 +78,7 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			}
 			return pollRequest{updatedSince: p.since.UnixMilli()}
 		}
-		return pollRequest{messages: at.message, parts: at.part, messageWatch: at.messageWatch, partWatches: at.partWatches}
+		return pollRequest{messages: at.message, parts: at.part, messageWatch: at.messageWatch, messageWatches: at.messageWatches, partWatches: at.partWatches}
 	})
 	if err != nil {
 		return nil, err
@@ -232,6 +233,7 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			at.message = advanceMessageCursor(at.message, changedMessages, nil)
 			at.part = advancePartCursor(at.part, changedParts, at.state)
 			at.messageWatch = authorityWatch(at.messageWatch, at.authority, changedMessages)
+			at.messageWatches = malformedMessageWatches(at.messageWatches, changedMessages, at.state)
 			at.partWatches = unresolvedPartWatches(at.partWatches, changedParts, at.state, at.roles)
 		}
 		if changed {
@@ -394,14 +396,29 @@ func unresolvedPartWatches(watches map[string]string, rows []partRow, state map[
 	return watches
 }
 
+func malformedMessageWatches(watches map[string]string, rows []messageRow, state map[string]emittedPart) map[string]string {
+	if watches == nil {
+		watches = make(map[string]string)
+	}
+	for _, row := range rows {
+		var data messageData
+		if json.Unmarshal([]byte(row.data), &data) != nil && state[row.id].malformed != "" {
+			watches[row.id] = rowFingerprint(row.data)
+		} else {
+			delete(watches, row.id)
+		}
+	}
+	return watches
+}
+
 func partCanStillEmit(row partRow, state emittedPart, role string) bool {
 	var header partHeader
 	if json.Unmarshal([]byte(row.data), &header) != nil {
-		return state.malformed == ""
+		return state.malformed != ""
 	}
 	var data partData
 	if json.Unmarshal([]byte(row.data), &data) != nil {
-		return state.malformed == ""
+		return state.malformed != ""
 	}
 	switch header.Type {
 	case "text":
