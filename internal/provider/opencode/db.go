@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
@@ -46,6 +47,8 @@ type pollStats struct {
 	messageRows  int
 	partRows     int
 	maxQueryArgs int
+	queryCount   int
+	watchQueries int
 }
 
 type rowCursor struct {
@@ -93,6 +96,7 @@ func (d *database) snapshot(ctx context.Context) (result dbSnapshot, retErr erro
 	defer tx.Rollback()
 
 	result.sessions, err = querySessions(ctx, tx)
+	d.lastPoll.queryCount++
 	if err == nil {
 		for _, session := range result.sessions {
 			result.messages[session.id], err = queryMessages(ctx, tx, session.id)
@@ -160,15 +164,19 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 			d.lastPoll.maxQueryArgs = args
 		}
 		result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.updatedSince, req.messages)
+		d.lastPoll.queryCount++
 		if err != nil {
 			return dbSnapshot{}, err
 		}
 		result.parts[session.id], err = queryPartsIncremental(ctx, tx, session.id, req.updatedSince, req.parts)
+		d.lastPoll.queryCount++
 		if err != nil {
 			return dbSnapshot{}, err
 		}
 		if req.messageWatch.id != "" && !hasMessage(result.messages[session.id], req.messageWatch.id) {
 			row, ok, err := queryMessageWatch(ctx, tx, session.id, req.messageWatch)
+			d.lastPoll.queryCount++
+			d.lastPoll.watchQueries++
 			if err != nil {
 				return dbSnapshot{}, err
 			}
@@ -176,16 +184,17 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 				result.messages[session.id] = append(result.messages[session.id], row)
 			}
 		}
-		for id, fingerprint := range req.partWatches {
-			if hasPart(result.parts[session.id], id) {
-				continue
-			}
-			row, ok, err := queryPartWatch(ctx, tx, session.id, rowWatch{id: id, fingerprint: fingerprint})
+		if len(req.partWatches) > 0 {
+			rows, err := queryPartWatches(ctx, tx, session.id, req.partWatches)
+			d.lastPoll.queryCount++
+			d.lastPoll.watchQueries++
 			if err != nil {
 				return dbSnapshot{}, err
 			}
-			if ok {
-				result.parts[session.id] = append(result.parts[session.id], row)
+			for _, row := range rows {
+				if !hasPart(result.parts[session.id], row.id) {
+					result.parts[session.id] = append(result.parts[session.id], row)
+				}
 			}
 		}
 		d.lastPoll.messageRows += len(result.messages[session.id])
@@ -207,14 +216,30 @@ func queryMessageWatch(ctx context.Context, tx *sql.Tx, sessionID string, watch 
 	return row, err == nil && rowFingerprint(row.data) != watch.fingerprint, err
 }
 
-func queryPartWatch(ctx context.Context, tx *sql.Tx, sessionID string, watch rowWatch) (partRow, bool, error) {
-	var row partRow
-	err := tx.QueryRowContext(ctx, `SELECT id,message_id,session_id,time_created,time_updated,data FROM part WHERE session_id = ? AND id = ?`, sessionID, watch.id).
-		Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return partRow{}, false, nil
+func queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]partRow, error) {
+	raw, err := json.Marshal(watches)
+	if err != nil {
+		return nil, err
 	}
-	return row, err == nil && rowFingerprint(row.data) != watch.fingerprint, err
+	rows, err := tx.QueryContext(ctx, `SELECT p.id,p.message_id,p.session_id,p.time_created,p.time_updated,p.data,w.value
+		FROM part p JOIN json_each(?) w ON w.key = p.id
+		WHERE p.session_id = ?`, string(raw), sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []partRow
+	for rows.Next() {
+		var row partRow
+		var fingerprint string
+		if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
+			return nil, err
+		}
+		if rowFingerprint(row.data) != fingerprint {
+			result = append(result, row)
+		}
+	}
+	return result, rows.Err()
 }
 
 func hasMessage(rows []messageRow, id string) bool {

@@ -127,9 +127,17 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 		if exists && at.agent.Backlog {
 			messages = messagesCreatedSince(changedMessages, p.since.UnixMilli())
 			parts = partsCreatedSince(changedParts, p.since.UnixMilli())
+			messages = appendRoleContext(at.roles, messages, parts)
 		}
 		if exists && !at.agent.Backlog {
 			messages = appendRoleContext(at.roles, messages, parts)
+		}
+		priorAgent := model.Agent{}
+		if exists {
+			priorAgent = at.agent
+			if session.agent == "" {
+				session.agent = at.agent.Name
+			}
 		}
 		p.lastNormalized.messageRows += len(changedMessages)
 		p.lastNormalized.partRows += len(changedParts)
@@ -206,7 +214,11 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 		if normalized.agent.Backlog {
 			at.backlogTools = normalized.agent.ToolCount
 			at.state = nil
-			at.roles = nil
+			at.roles = make(map[string]string)
+			updateRoles(at.roles, changedMessages)
+			if normalized.agent.Name == "" {
+				normalized.agent.Name = priorAgent.Name
+			}
 			at.authority = messageAuthority{}
 			at.message = rowCursor{}
 			at.part = rowCursor{}
@@ -220,7 +232,7 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			at.message = advanceMessageCursor(at.message, changedMessages, nil)
 			at.part = advancePartCursor(at.part, changedParts, at.state)
 			at.messageWatch = authorityWatch(at.messageWatch, at.authority, changedMessages)
-			at.partWatches = unresolvedPartWatches(at.partWatches, changedParts, at.state)
+			at.partWatches = unresolvedPartWatches(at.partWatches, changedParts, at.state, at.roles)
 		}
 		if changed {
 			updates = append(updates, provider.Update{Agent: at.agent, Events: events})
@@ -367,19 +379,44 @@ func authorityWatch(prior rowWatch, authority messageAuthority, rows []messageRo
 	return rowWatch{id: authority.id}
 }
 
-func unresolvedPartWatches(watches map[string]string, rows []partRow, state map[string]emittedPart) map[string]string {
+func unresolvedPartWatches(watches map[string]string, rows []partRow, state map[string]emittedPart, roles map[string]string) map[string]string {
 	if watches == nil {
 		watches = make(map[string]string)
 	}
 	for _, row := range rows {
 		s := state[row.id]
-		if !s.user && !s.textDone && !s.reasoningDone && !s.toolResult {
+		if partCanStillEmit(row, s, roles[row.messageID]) {
 			watches[row.id] = rowFingerprint(row.data)
 		} else {
 			delete(watches, row.id)
 		}
 	}
 	return watches
+}
+
+func partCanStillEmit(row partRow, state emittedPart, role string) bool {
+	var header partHeader
+	if json.Unmarshal([]byte(row.data), &header) != nil {
+		return state.malformed == ""
+	}
+	var data partData
+	if json.Unmarshal([]byte(row.data), &data) != nil {
+		return state.malformed == ""
+	}
+	switch header.Type {
+	case "text":
+		if role == "user" {
+			return !state.user
+		}
+		return role == "assistant" && !state.textDone
+	case "reasoning":
+		return !state.reasoningDone
+	case "tool":
+		terminal := data.State.Status == "completed" || data.State.Status == "error" || data.State.Status == "errored"
+		return !state.toolUse || !terminal && !state.toolResult
+	default:
+		return false
+	}
 }
 
 func authorityStatus(authority messageAuthority) (model.Status, time.Time) {

@@ -1674,6 +1674,108 @@ func TestMetadataOnlyPollPropagatesParentCycle(t *testing.T) {
 	}
 }
 
+func TestUnsupportedPartsDoNotCreateUnresolvedWatchQueries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3000; i++ {
+		if _, err := tx.Exec(`INSERT INTO part VALUES (?,?,?,?,?,?)`, fmt.Sprintf("unsupported-%04d", i), "assistant", "child", base, base, `{"type":"snapshot","value":"historical"}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.partWatches) != 0 {
+		t.Fatalf("unsupported parts created %d unresolved watches", len(at.partWatches))
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("idle poll = %+v, %v", updates, err)
+	}
+	if p.db.lastPoll.watchQueries != 1 || p.db.lastPoll.queryCount > 5 || p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("idle query instrumentation = %+v", p.db.lastPoll)
+	}
+}
+
+func TestBacklogResumeUsesPreStartMessageRolesForNewParts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	since := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	old := since.Add(-time.Second).UnixMilli()
+	insertSession(t, db, "child", "parent", old)
+	if _, err := db.Exec(`UPDATE session SET agent=NULL,time_updated=? WHERE id='child'`, old); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "old-user", old, old, `{"role":"user","agent":"general"}`)
+	insertMessage(t, db, "child", "old-assistant", old+1, old+1, `{"role":"assistant","agent":"general"}`)
+	insertPart(t, db, "child", "old-user", "old-prompt", old, old, `{"type":"text","text":"historical prompt"}`)
+
+	p := New(path, 0, since)
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.roles) != 2 || at.roles["old-user"] != "user" || at.roles["old-assistant"] != "assistant" {
+		t.Fatalf("backlog compact roles = %+v", at.roles)
+	}
+	post := since.UnixMilli() + 1
+	insertPart(t, db, "child", "old-user", "new-user-part", post, post, `{"type":"text","text":"new user content"}`)
+	insertPart(t, db, "child", "old-assistant", "new-assistant-part", post+1, post+1, fmt.Sprintf(`{"type":"text","text":"new answer","time":{"end":%d}}`, post+1))
+	insertPart(t, db, "child", "old-assistant", "old-created-part", old, post+2, fmt.Sprintf(`{"type":"text","text":"must stay suppressed","time":{"end":%d}}`, post+2))
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, post+2); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 || !reflect.DeepEqual(normalizedKinds(updates[0].Events), []model.EventKind{model.EvUser, model.EvText, model.EvStatus}) {
+		t.Fatalf("resume events = %+v", updates)
+	}
+	if updates[0].Agent.Name != "general" || updates[0].Agent.Prompt != "historical prompt" {
+		t.Fatalf("resume metadata = %+v", updates[0].Agent)
+	}
+}
+
+func TestPartOnlyDeltaPreservesResolvedNameAndNormalizedTitle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	if _, err := db.Exec(`UPDATE session SET agent=NULL,title='Review code (@general subagent)' WHERE id='child'`); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant","agent":"general"}`)
+	insertPart(t, db, "child", "assistant", "text", base+1, base+1, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, base+1))
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 || first[0].Agent.Title != "Review code" {
+		t.Fatalf("initial metadata = %+v, %v", first, err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+1, base+2)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := p.Poll()
+	if err != nil || len(second) != 1 {
+		t.Fatalf("part-only delta = %+v, %v", second, err)
+	}
+	if second[0].Agent.Name != "general" || second[0].Agent.Title != "Review code" {
+		t.Fatalf("part-only metadata flicker = %+v", second[0].Agent)
+	}
+}
+
 func normalizedKinds(events []model.Event) []model.EventKind {
 	result := make([]model.EventKind, len(events))
 	for i := range events {
