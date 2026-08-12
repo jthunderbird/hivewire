@@ -1,5 +1,6 @@
-// Command hivewire streams live Claude Code and Codex subagent activity into a
-// terminal UI and a LAN-reachable web page, four panes at a time.
+// Command hivewire streams live Claude Code, Codex and OpenCode subagent
+// activity into a terminal UI and a LAN-reachable web page, four panes at a
+// time.
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"github.com/jtaylor/hivewire/internal/provider"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
+	"github.com/jtaylor/hivewire/internal/provider/opencode"
 	"github.com/jtaylor/hivewire/internal/store"
 	"github.com/jtaylor/hivewire/internal/tui"
 	"github.com/jtaylor/hivewire/internal/web"
@@ -70,11 +72,7 @@ func run() error {
 	// Transcripts already on disk at launch are indexed as history; only agents
 	// that appear from now on take a live pane.
 	since := time.Now()
-	idle := time.Duration(cfg.IdleDoneSec) * time.Second
-	providers := []provider.Provider{
-		claudecode.New(cfg.ClaudeRoot, idle, since),
-		codex.New(cfg.CodexRoot, idle, since),
-	}
+	providers := providersFor(cfg, time.Duration(cfg.IdleDoneSec)*time.Second, since)
 
 	done := make(chan struct{})
 	go idx.RunFlusher(done, 5*time.Second)
@@ -85,8 +83,7 @@ func run() error {
 		srv := &web.Server{
 			Hub:   h,
 			Store: idx,
-			// Overflow files live beside the transcripts, so allow their parents.
-			Roots: []string{filepath.Dir(cfg.ClaudeRoot), filepath.Dir(cfg.CodexRoot)},
+			Roots: overflowRoots(cfg),
 		}
 		addr := net.JoinHostPort(cfg.Addr, fmt.Sprint(cfg.Port))
 		ln, err := net.Listen("tcp", addr)
@@ -147,6 +144,28 @@ func hostForURL(addr string, port int) string {
 		}
 	}
 	return net.JoinHostPort(host, fmt.Sprint(port))
+}
+
+// providersFor builds the provider set hivewire polls.
+func providersFor(cfg config.Config, idle time.Duration, since time.Time) []provider.Provider {
+	return []provider.Provider{
+		claudecode.New(cfg.ClaudeRoot, idle, since),
+		codex.New(cfg.CodexRoot, idle, since),
+		opencode.New(cfg.OpenCodeDB, idle, since),
+	}
+}
+
+// overflowRoots lists the directories the web server may read truncated tool
+// output from. Claude Code and Codex keep those files beside their transcripts,
+// while OpenCode keeps them in a tool-output directory beside its database. Only
+// that directory is allowed, because the database's own directory also holds
+// credentials.
+func overflowRoots(cfg config.Config) []string {
+	return []string{
+		filepath.Dir(cfg.ClaudeRoot),
+		filepath.Dir(cfg.CodexRoot),
+		filepath.Join(filepath.Dir(cfg.OpenCodeDB), "tool-output"),
+	}
 }
 
 // poll drives every provider on a ticker and feeds the hub.

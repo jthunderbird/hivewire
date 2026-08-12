@@ -28,12 +28,12 @@ type Tokens struct {
 type Agent struct {
 	ID       string `json:"id"`       // globally unique: "<provider>:<native id>"
 	NativeID string `json:"nativeId"` // provider-local id
-	Provider string `json:"provider"` // "claude" | "codex"
+	Provider string `json:"provider"` // "claude" | "codex" | "opencode"
 	Model    string `json:"model"`
 
-	Name     string `json:"name"`     // claude: agentType; codex: basename(agent_path)
+	Name     string `json:"name"`     // claude: agentType; codex: basename(agent_path); opencode: agent
 	Nickname string `json:"nickname"` // codex only
-	Title    string `json:"title"`    // claude: Task description; codex: derived
+	Title    string `json:"title"`    // claude: Task description; codex: derived; opencode: session title
 	Prompt   string `json:"prompt"`   // the task the agent was given, for search
 	Depth    int    `json:"depth"`
 	Parent   string `json:"parent"`
@@ -46,7 +46,7 @@ type Agent struct {
 	SessionKind string `json:"sessionKind"`
 	CLIVersion  string `json:"cliVersion"`
 
-	Source string `json:"source"` // transcript path on disk
+	Source string `json:"source"` // transcript path on disk, or database path for opencode
 
 	Started time.Time `json:"started"`
 	Updated time.Time `json:"updated"`

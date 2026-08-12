@@ -1,6 +1,7 @@
 package web
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,8 @@ import (
 	"github.com/jtaylor/hivewire/internal/model"
 	"github.com/jtaylor/hivewire/internal/provider"
 	"github.com/jtaylor/hivewire/internal/store"
+
+	_ "modernc.org/sqlite"
 )
 
 func newServer(t *testing.T, roots ...string) (*Server, *hub.Hub) {
@@ -135,5 +138,128 @@ func TestUIIsServedAndCORSIsOpen(t *testing.T) {
 	}
 	if rr.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Error("LAN use requires open CORS")
+	}
+}
+
+// openCodeFixture writes a minimal OpenCode database holding one finished child
+// session, returning its path.
+func openCodeFixture(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "opencode.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	schema := []string{
+		`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL,
+			title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+			agent TEXT, model TEXT, tokens_input INTEGER NOT NULL DEFAULT 0, tokens_output INTEGER NOT NULL DEFAULT 0,
+			tokens_reasoning INTEGER NOT NULL DEFAULT 0, tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+			tokens_cache_write INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+			time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)`,
+		`INSERT INTO session VALUES ('ses_child','project','ses_parent','/work','Audit parser','1.15.7',1000,2000,'general','gpt-5.6-sol',10,5,0,0,0)`,
+		`INSERT INTO message VALUES ('msg_user','ses_child',1100,1100,'{"role":"user"}')`,
+		`INSERT INTO message VALUES ('msg_assistant','ses_child',1200,2000,'{"role":"assistant","time":{"completed":2000},"finish":"stop"}')`,
+		`INSERT INTO part VALUES ('part_prompt','msg_user','ses_child',1100,1100,'{"type":"text","text":"audit the parser"}')`,
+		`INSERT INTO part VALUES ('part_answer','msg_assistant','ses_child',1300,1400,'{"type":"text","text":"done","time":{"start":1300,"end":1400}}')`,
+	}
+	for _, stmt := range schema {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+func TestReplayDispatchesOpenCodeUsingIndexedNativeID(t *testing.T) {
+	dir := t.TempDir()
+	path := openCodeFixture(t, dir)
+	indexPath := filepath.Join(t.TempDir(), "index.json")
+	idx, err := store.Open(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Upsert(model.Agent{
+		ID: "opencode:ses_child", NativeID: "ses_child", Provider: "opencode",
+		Source: path, Status: model.StatusDone,
+	})
+	if err := idx.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen so replay uses the persisted record, not in-memory state.
+	reopened, err := store.Open(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Hub: hub.New(4, 1<<20), Store: reopened}
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/replay?id=opencode:ses_child", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%q", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Agent  model.Agent   `json:"agent"`
+		Events []model.Event `json:"events"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent.ID != "opencode:ses_child" || got.Agent.NativeID != "ses_child" || got.Agent.Title != "Audit parser" {
+		t.Fatalf("replayed agent = %+v", got.Agent)
+	}
+	if len(got.Events) == 0 {
+		t.Fatal("replay returned no events")
+	}
+	for _, event := range got.Events {
+		if event.AgentID != got.Agent.ID {
+			t.Fatalf("event agent id = %q", event.AgentID)
+		}
+	}
+}
+
+func TestReplayRejectsOpenCodeRecordWithoutNativeID(t *testing.T) {
+	dir := t.TempDir()
+	path := openCodeFixture(t, dir)
+	s, _ := newServer(t)
+	s.Store.Upsert(model.Agent{ID: "opencode:ses_child", Provider: "opencode", Source: path})
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/replay?id=opencode:ses_child", nil))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestOverflowAllowsOpenCodeToolOutputButNotItsDatabaseDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	toolOutput := filepath.Join(dataDir, "tool-output")
+	if err := os.MkdirAll(toolOutput, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	allowed := filepath.Join(toolOutput, "tool_1")
+	if err := os.WriteFile(allowed, []byte("full tool output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(dataDir, "auth.json")
+	if err := os.WriteFile(secret, []byte(`{"token":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := newServer(t, toolOutput)
+
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/overflow?path="+allowed, nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "full tool output" {
+		t.Fatalf("tool output code=%d body=%q", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/overflow?path="+secret, nil))
+	if rr.Code == http.StatusOK {
+		t.Fatal("auth.json beside the OpenCode database was served")
 	}
 }

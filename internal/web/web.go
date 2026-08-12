@@ -23,6 +23,7 @@ import (
 	"github.com/jtaylor/hivewire/internal/model"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
+	"github.com/jtaylor/hivewire/internal/provider/opencode"
 	"github.com/jtaylor/hivewire/internal/store"
 )
 
@@ -169,6 +170,14 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
 		a, events, err = claudecode.Replay(rec.Source)
 	case codex.Name:
 		a, events, err = codex.Replay(rec.Source)
+	case opencode.Name:
+		// OpenCode transcripts are database rows, so replay needs the session ID
+		// the index kept rather than a file path.
+		if rec.NativeID == "" {
+			http.Error(w, "missing session id", http.StatusBadRequest)
+			return
+		}
+		a, events, err = opencode.Replay(rec.Source, rec.NativeID)
 	default:
 		http.Error(w, "unknown provider", http.StatusBadRequest)
 		return

@@ -1,8 +1,8 @@
 // Package store keeps a browsable index of every agent hivewire has seen.
 //
-// It deliberately stores no transcript content: Claude Code and Codex both keep
-// their transcripts indefinitely, so history is an index over files that
-// already exist and replay reads the original bytes back off disk.
+// It deliberately stores no transcript content: every supported agent CLI keeps
+// its own history indefinitely, so this is an index over records that already
+// exist and replay reads the original transcript or database rows back.
 package store
 
 import (
