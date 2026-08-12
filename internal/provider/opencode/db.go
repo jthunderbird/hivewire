@@ -3,7 +3,6 @@ package opencode
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
@@ -31,12 +30,10 @@ type partRow struct {
 }
 
 type dbSnapshot struct {
-	present         bool
-	sessions        []sessionRow
-	messages        map[string][]messageRow
-	parts           map[string][]partRow
-	missingMessages map[string][]string
-	missingParts    map[string][]string
+	present  bool
+	sessions []sessionRow
+	messages map[string][]messageRow
+	parts    map[string][]partRow
 }
 
 type database struct {
@@ -46,30 +43,26 @@ type database struct {
 	replaced bool
 }
 
+// pollStats records what one poll actually read, so tests can prove the
+// incremental path stays quiet when nothing changed.
 type pollStats struct {
-	messageRows     int
-	partRows        int
-	maxQueryArgs    int
-	queryCount      int
-	watchQueries    int
-	maxWatchPayload int
+	queryCount  int
+	messageRows int
+	partRows    int
 }
 
-const maxWatchPayloadBytes = 64 * 1024
-
+// rowCursor is a high-water mark over time_updated plus the fingerprints of the
+// rows sitting exactly on it, so a mutation that lands in the same millisecond
+// is still seen while an unchanged row is not re-emitted.
 type rowCursor struct {
 	updated  int64
 	frontier map[string]string
 }
 
 type pollRequest struct {
-	skip           bool
-	skipRows       bool
-	updatedSince   int64
-	messages       rowCursor
-	parts          rowCursor
-	messageWatches map[string]string
-	partWatches    map[string]string
+	skip     bool
+	messages rowCursor
+	parts    rowCursor
 }
 
 func newDatabase(path string) *database {
@@ -125,8 +118,8 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 	d.lastPoll = pollStats{}
 	d.replaced = false
 	result = dbSnapshot{
-		messages: make(map[string][]messageRow), parts: make(map[string][]partRow),
-		missingMessages: make(map[string][]string), missingParts: make(map[string][]string),
+		messages: make(map[string][]messageRow),
+		parts:    make(map[string][]partRow),
 	}
 	info, err := os.Stat(d.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -164,48 +157,15 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		if req.skip {
 			continue
 		}
-		args := 1
-		if req.updatedSince > 0 || req.messages.updated > 0 || req.parts.updated > 0 {
-			args = 2
+		result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.messages)
+		d.lastPoll.queryCount++
+		if err != nil {
+			return dbSnapshot{}, err
 		}
-		if args > d.lastPoll.maxQueryArgs {
-			d.lastPoll.maxQueryArgs = args
-		}
-		if !req.skipRows {
-			result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.updatedSince, req.messages)
-			d.lastPoll.queryCount++
-			if err != nil {
-				return dbSnapshot{}, err
-			}
-			result.parts[session.id], err = queryPartsIncremental(ctx, tx, session.id, req.updatedSince, req.parts)
-			d.lastPoll.queryCount++
-			if err != nil {
-				return dbSnapshot{}, err
-			}
-		}
-		if len(req.messageWatches) > 0 {
-			rows, missing, err := d.queryMessageWatches(ctx, tx, session.id, req.messageWatches)
-			if err != nil {
-				return dbSnapshot{}, err
-			}
-			for _, row := range rows {
-				if !hasMessage(result.messages[session.id], row.id) {
-					result.messages[session.id] = append(result.messages[session.id], row)
-				}
-			}
-			result.missingMessages[session.id] = append(result.missingMessages[session.id], missing...)
-		}
-		if len(req.partWatches) > 0 {
-			rows, missing, err := d.queryPartWatches(ctx, tx, session.id, req.partWatches)
-			if err != nil {
-				return dbSnapshot{}, err
-			}
-			for _, row := range rows {
-				if !hasPart(result.parts[session.id], row.id) {
-					result.parts[session.id] = append(result.parts[session.id], row)
-				}
-			}
-			result.missingParts[session.id] = append(result.missingParts[session.id], missing...)
+		result.parts[session.id], err = queryPartsIncremental(ctx, tx, session.id, req.parts)
+		d.lastPoll.queryCount++
+		if err != nil {
+			return dbSnapshot{}, err
 		}
 		d.lastPoll.messageRows += len(result.messages[session.id])
 		d.lastPoll.partRows += len(result.parts[session.id])
@@ -214,141 +174,6 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		return dbSnapshot{}, err
 	}
 	return result, nil
-}
-
-func (d *database) queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]partRow, []string, error) {
-	var result []partRow
-	existing := make(map[string]bool)
-	for _, batch := range watchBatches(watches) {
-		raw, err := json.Marshal(batch)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.recordWatchQuery(len(raw))
-		rows, err := tx.QueryContext(ctx, `SELECT p.id,p.message_id,p.session_id,p.time_created,p.time_updated,p.data,w.value
-		FROM part p JOIN json_each(?) w ON w.key = p.id
-		WHERE p.session_id = ?`, string(raw), sessionID)
-		if err != nil {
-			return nil, nil, err
-		}
-		for rows.Next() {
-			var row partRow
-			var fingerprint string
-			if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
-				rows.Close()
-				return nil, nil, err
-			}
-			existing[row.id] = true
-			if rowFingerprint(row.data) != fingerprint {
-				result = append(result, row)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		if err := rows.Close(); err != nil {
-			return nil, nil, err
-		}
-	}
-	return result, missingWatchIDs(watches, existing), nil
-}
-
-func (d *database) queryMessageWatches(ctx context.Context, tx *sql.Tx, sessionID string, watches map[string]string) ([]messageRow, []string, error) {
-	var result []messageRow
-	existing := make(map[string]bool)
-	for _, batch := range watchBatches(watches) {
-		raw, err := json.Marshal(batch)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.recordWatchQuery(len(raw))
-		rows, err := tx.QueryContext(ctx, `SELECT m.id,m.session_id,m.time_created,m.time_updated,m.data,w.value
-		FROM message m JOIN json_each(?) w ON w.key = m.id
-		WHERE m.session_id = ?`, string(raw), sessionID)
-		if err != nil {
-			return nil, nil, err
-		}
-		for rows.Next() {
-			var row messageRow
-			var fingerprint string
-			if err := rows.Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data, &fingerprint); err != nil {
-				rows.Close()
-				return nil, nil, err
-			}
-			existing[row.id] = true
-			if rowFingerprint(row.data) != fingerprint {
-				result = append(result, row)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		if err := rows.Close(); err != nil {
-			return nil, nil, err
-		}
-	}
-	return result, missingWatchIDs(watches, existing), nil
-}
-
-func (d *database) recordWatchQuery(payload int) {
-	d.lastPoll.queryCount++
-	d.lastPoll.watchQueries++
-	if payload > d.lastPoll.maxWatchPayload {
-		d.lastPoll.maxWatchPayload = payload
-	}
-	if d.lastPoll.maxQueryArgs < 2 {
-		d.lastPoll.maxQueryArgs = 2
-	}
-}
-
-func watchBatches(watches map[string]string) []map[string]string {
-	var batches []map[string]string
-	batch := make(map[string]string)
-	size := 2
-	for id, fingerprint := range watches {
-		entrySize := len(id) + len(fingerprint) + 6
-		if len(batch) > 0 && size+entrySize > maxWatchPayloadBytes {
-			batches = append(batches, batch)
-			batch = make(map[string]string)
-			size = 2
-		}
-		batch[id] = fingerprint
-		size += entrySize
-	}
-	if len(batch) > 0 {
-		batches = append(batches, batch)
-	}
-	return batches
-}
-
-func missingWatchIDs(watches map[string]string, existing map[string]bool) []string {
-	var result []string
-	for id := range watches {
-		if !existing[id] {
-			result = append(result, id)
-		}
-	}
-	return result
-}
-
-func hasMessage(rows []messageRow, id string) bool {
-	for _, row := range rows {
-		if row.id == id {
-			return true
-		}
-	}
-	return false
-}
-
-func hasPart(rows []partRow, id string) bool {
-	for _, row := range rows {
-		if row.id == id {
-			return true
-		}
-	}
-	return false
 }
 
 func openDatabase(ctx context.Context, path string) (*sql.DB, bool, error) {
@@ -465,18 +290,14 @@ func queryParts(ctx context.Context, tx *sql.Tx, sessionID string) ([]partRow, e
 	return result, rows.Err()
 }
 
-func queryMessagesIncremental(ctx context.Context, tx *sql.Tx, sessionID string, updatedSince int64, cursor rowCursor) ([]messageRow, error) {
+// queryMessagesIncremental reads only rows at or after the cursor's high-water
+// mark, dropping the ones on the mark whose content is unchanged.
+func queryMessagesIncremental(ctx context.Context, tx *sql.Tx, sessionID string, cursor rowCursor) ([]messageRow, error) {
 	query := `SELECT id,session_id,time_created,time_updated,data FROM message WHERE session_id = ?`
 	args := []any{sessionID}
-	if updatedSince > 0 {
-		query += ` AND time_updated >= ?`
-		args = append(args, updatedSince)
-	} else if cursor.updated > 0 {
+	if cursor.updated > 0 {
 		query += ` AND time_updated >= ?`
 		args = append(args, cursor.updated)
-	}
-	if len(args) > 2 {
-		panic("incremental message query has unbounded arguments")
 	}
 	query += ` ORDER BY time_created,id`
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -498,18 +319,13 @@ func queryMessagesIncremental(ctx context.Context, tx *sql.Tx, sessionID string,
 	return result, rows.Err()
 }
 
-func queryPartsIncremental(ctx context.Context, tx *sql.Tx, sessionID string, updatedSince int64, cursor rowCursor) ([]partRow, error) {
+// queryPartsIncremental is queryMessagesIncremental for message parts.
+func queryPartsIncremental(ctx context.Context, tx *sql.Tx, sessionID string, cursor rowCursor) ([]partRow, error) {
 	query := `SELECT id,message_id,session_id,time_created,time_updated,data FROM part WHERE session_id = ?`
 	args := []any{sessionID}
-	if updatedSince > 0 {
-		query += ` AND time_updated >= ?`
-		args = append(args, updatedSince)
-	} else if cursor.updated > 0 {
+	if cursor.updated > 0 {
 		query += ` AND time_updated >= ?`
 		args = append(args, cursor.updated)
-	}
-	if len(args) > 2 {
-		panic("incremental part query has unbounded arguments")
 	}
 	query += ` ORDER BY time_created,id`
 	rows, err := tx.QueryContext(ctx, query, args...)

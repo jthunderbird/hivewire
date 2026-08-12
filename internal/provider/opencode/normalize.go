@@ -13,8 +13,12 @@ import (
 	"github.com/jtaylor/hivewire/internal/provider"
 )
 
+// emittedPart records which phases of one row have already reached the stream.
+// Rows mutate in place, so a text part is only "done" once its completion was
+// emitted and a tool part emits its invocation and its result separately. The
+// malformed and assistantError fields hold the fingerprint of the data that
+// produced the last notice, so a changed row can raise a fresh one.
 type emittedPart struct {
-	fingerprint             string
 	user                    bool
 	textDone, reasoningDone bool
 	toolUse, toolResult     bool
@@ -136,11 +140,6 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 		}
 		fingerprint := rowFingerprint(row.data)
 		state := prior[row.id]
-		if state.fingerprint != fingerprint {
-			state.malformed = ""
-			state.assistantError = ""
-		}
-		state.fingerprint = fingerprint
 
 		var data messageData
 		if err := json.Unmarshal([]byte(row.data), &data); err != nil {
@@ -209,10 +208,6 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 		result.agent.Updated = laterTime(result.agent.Updated, unixMillis(row.timeUpdated))
 		fingerprint := rowFingerprint(row.data)
 		state := prior[row.id]
-		if state.fingerprint != fingerprint {
-			state.malformed = ""
-		}
-		state.fingerprint = fingerprint
 
 		var header partHeader
 		if err := json.Unmarshal([]byte(row.data), &header); err != nil {

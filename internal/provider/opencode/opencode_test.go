@@ -991,16 +991,16 @@ func TestPollStreamsMutablePhasesAndLifecycleOnce(t *testing.T) {
 	}
 
 	completed := base + 100
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+30, base+60)); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+30, base+60), base+60); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"thought","time":{"start":%d,"end":%d}}`, base+35, base+65)); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"thought","time":{"start":%d,"end":%d}}`, base+35, base+65), base+65); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='tool'`, fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok","time":{"start":%d,"end":%d}}}`, base+40, base+70)); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='tool'`, fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok","time":{"start":%d,"end":%d}}}`, base+40, base+70), base+70); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE message SET data=? WHERE id='assistant'`, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, completed)); err != nil {
+	if _, err := db.Exec(`UPDATE message SET data=?,time_updated=? WHERE id='assistant'`, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, completed), completed); err != nil {
 		t.Fatal(err)
 	}
 	second, err := p.Poll()
@@ -1018,7 +1018,7 @@ func TestPollStreamsMutablePhasesAndLifecycleOnce(t *testing.T) {
 	if second[0].Agent.ToolCount != 1 {
 		t.Fatalf("tool result transition double-counted tool: %+v", second[0].Agent)
 	}
-	if second[0].Agent.Updated.UnixMilli() != base+40 || second[0].Agent.DurationMS != 40 {
+	if second[0].Agent.Updated.UnixMilli() != completed || second[0].Agent.DurationMS != 100 {
 		t.Fatalf("deterministic updated/duration = %v/%d", second[0].Agent.Updated, second[0].Agent.DurationMS)
 	}
 	third, err := p.Poll()
@@ -1463,8 +1463,8 @@ func TestPollIncrementalReadsAndBoundedBacklogState(t *testing.T) {
 	if p.db.lastPoll.messageRows != 3 || p.db.lastPoll.partRows != 102 {
 		t.Fatalf("initial hydration rows = %+v", p.db.lastPoll)
 	}
-	if state := p.agents[Name+":backlog"].state; len(state) != 0 {
-		t.Fatalf("backlog retained %d row fingerprints", len(state))
+	if state := p.agents[Name+":backlog"].state; len(state) != 101 {
+		t.Fatalf("backlog phases = %d, want one per row read once", len(state))
 	}
 
 	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
@@ -1474,8 +1474,12 @@ func TestPollIncrementalReadsAndBoundedBacklogState(t *testing.T) {
 		t.Fatalf("idle poll read rows: %+v", p.db.lastPoll)
 	}
 
-	// Mutate at the existing high-water mark without touching session metadata.
+	// Mutate at the existing high-water mark: the row keeps its time_updated, so
+	// only the fingerprint kept for that millisecond can tell it changed.
 	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='live-text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, live+2, live+3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='live'`, live+3); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := p.Poll()
@@ -1520,8 +1524,8 @@ func TestIncrementalBacklogResumeReadsOnlyPostStartRows(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if len(p.agents[Name+":child"].state) != 0 {
-		t.Fatal("backlog retained per-row state")
+	if len(p.agents[Name+":child"].state) != 2 {
+		t.Fatalf("backlog phases = %d, want one per row read once", len(p.agents[Name+":child"].state))
 	}
 
 	post := since.UnixMilli() + 1
@@ -1584,8 +1588,8 @@ func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T)
 	if len(idle) != 1 || idle[0].Agent.Status != model.StatusDone || !reflect.DeepEqual(normalizedKinds(idle[0].Events), []model.EventKind{model.EvStatus}) {
 		t.Fatalf("idle transition = %+v", idle)
 	}
-	if !p.agents[Name+":child"].dormant {
-		t.Fatal("idle terminal agent did not become dormant")
+	if !p.agents[Name+":child"].quiet {
+		t.Fatal("idle terminal agent kept querying rows")
 	}
 	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
 		t.Fatalf("idle terminal follow-up = %+v, stats=%+v, err=%v", updates, p.db.lastPoll, err)
@@ -1624,46 +1628,35 @@ func TestIncrementalStateAndSQLStayBoundedAfterLargeLiveHistory(t *testing.T) {
 	}
 	at := p.agents[Name+":child"]
 	if len(at.state) != 6000 {
-		t.Fatalf("compact emitted IDs = %d, want 6000 message/part phases", len(at.state))
+		t.Fatalf("emitted phases = %d, want 6000 message/part rows", len(at.state))
 	}
-	for id, state := range at.state {
-		if state.fingerprint != "" {
-			t.Fatalf("completed state %s retained fingerprint", id)
-		}
-	}
-	if len(at.message.frontier) > 1 || len(at.part.frontier) > 1 {
-		t.Fatalf("frontiers grew with history: messages=%d parts=%d", len(at.message.frontier), len(at.part.frontier))
-	}
-	if p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("initial query args = %d, want at most session+watermark", p.db.lastPoll.maxQueryArgs)
+	if len(at.messages.frontier) > 1 || len(at.parts.frontier) > 1 {
+		t.Fatalf("frontiers grew with history: messages=%d parts=%d", len(at.messages.frontier), len(at.parts.frontier))
 	}
 
 	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
 		t.Fatalf("idle poll = %+v, %v", updates, err)
 	}
-	if p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("idle query args = %d, grew with history", p.db.lastPoll.maxQueryArgs)
-	}
-	if p.lastNormalized.messageRows != 0 || p.lastNormalized.partRows != 0 {
-		t.Fatalf("idle normalized rows = %+v", p.lastNormalized)
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("idle poll read rows: %+v", p.db.lastPoll)
 	}
 
+	// A one-row change re-reads one row, not the history behind it.
 	lastPart := "part-message-2999"
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id=?`, `{"type":"text","text":"changed","time":{"end":2}}`, lastPart); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id=?`, `{"type":"text","text":"changed","time":{"end":2}}`, base+4000, lastPart); err != nil {
 		t.Fatal(err)
 	}
-	updates, err := p.Poll()
-	if err != nil {
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+4000); err != nil {
 		t.Fatal(err)
 	}
-	if len(updates) != 0 || p.lastNormalized.messageRows != 0 || p.lastNormalized.partRows != 1 {
-		t.Fatalf("one-row delta = %+v, normalized=%+v", updates, p.lastNormalized)
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
 	}
-	if p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("post-delta query args=%d", p.db.lastPoll.maxQueryArgs)
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 1 {
+		t.Fatalf("one-row delta read = %+v", p.db.lastPoll)
 	}
 	if len(at.state) != 6000 {
-		t.Fatalf("delta replaced compact emitted IDs: %d", len(at.state))
+		t.Fatalf("delta replaced emitted phases: %d", len(at.state))
 	}
 }
 
@@ -1685,7 +1678,7 @@ func TestMetadataOnlyPollPropagatesParentCycle(t *testing.T) {
 	}
 }
 
-func TestUnsupportedPartsDoNotCreateUnresolvedWatchQueries(t *testing.T) {
+func TestUnsupportedPartsAreReadOnceAndThenStayQuiet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1705,18 +1698,20 @@ func TestUnsupportedPartsDoNotCreateUnresolvedWatchQueries(t *testing.T) {
 	}
 
 	p := New(path, 0, time.UnixMilli(base-1))
-	if _, err := p.Poll(); err != nil {
+	first, err := p.Poll()
+	if err != nil {
 		t.Fatal(err)
 	}
-	at := p.agents[Name+":child"]
-	if len(at.partWatches) != 0 {
-		t.Fatalf("unsupported parts created %d unresolved watches", len(at.partWatches))
+	if len(first) != 1 || len(first[0].Events) != 0 {
+		t.Fatalf("unsupported parts emitted events: %+v", first)
 	}
-	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
-		t.Fatalf("idle poll = %+v, %v", updates, err)
+	for i := 0; i < 2; i++ {
+		if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+			t.Fatalf("idle poll %d = %+v, %v", i, updates, err)
+		}
 	}
-	if p.db.lastPoll.watchQueries != 1 || p.db.lastPoll.queryCount > 5 || p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("idle query instrumentation = %+v", p.db.lastPoll)
+	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("quiet session still queried rows: %+v", p.db.lastPoll)
 	}
 }
 
@@ -1739,7 +1734,7 @@ func TestBacklogResumeUsesPreStartMessageRolesForNewParts(t *testing.T) {
 	}
 	at := p.agents[Name+":child"]
 	if len(at.roles) != 2 || at.roles["old-user"] != "user" || at.roles["old-assistant"] != "assistant" {
-		t.Fatalf("backlog compact roles = %+v", at.roles)
+		t.Fatalf("backlog roles = %+v", at.roles)
 	}
 	post := since.UnixMilli() + 1
 	insertPart(t, db, "child", "old-user", "new-user-part", post, post, `{"type":"text","text":"new user content"}`)
@@ -1775,7 +1770,7 @@ func TestPartOnlyDeltaPreservesResolvedNameAndNormalizedTitle(t *testing.T) {
 	if err != nil || len(first) != 1 || first[0].Agent.Title != "Review code" {
 		t.Fatalf("initial metadata = %+v, %v", first, err)
 	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+1, base+2)); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+1, base+2), base+2); err != nil {
 		t.Fatal(err)
 	}
 	second, err := p.Poll()
@@ -1787,7 +1782,7 @@ func TestPartOnlyDeltaPreservesResolvedNameAndNormalizedTitle(t *testing.T) {
 	}
 }
 
-func TestOlderMalformedPartRecoversAfterHighWaterAdvance(t *testing.T) {
+func TestMalformedPartRecoversWhenItsRowChanges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1800,11 +1795,10 @@ func TestOlderMalformedPartRecoversAfterHighWaterAdvance(t *testing.T) {
 	if err != nil || len(first) != 1 || normalizedKinds(first[0].Events)[0] != model.EvNotice {
 		t.Fatalf("initial malformed poll = %+v, %v", first, err)
 	}
-	at := p.agents[Name+":child"]
-	if len(at.partWatches) != 1 || at.partWatches["malformed"] == "" {
-		t.Fatalf("malformed part watches = %+v", at.partWatches)
-	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='malformed'`, fmt.Sprintf(`{"type":"text","text":"recovered","time":{"end":%d}}`, base+11)); err != nil {
+
+	// OpenCode advances time_updated on every in-place row change, so the
+	// corrected row comes back through the ordinary cursor query.
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='malformed'`, fmt.Sprintf(`{"type":"text","text":"recovered","time":{"end":%d}}`, base+11), base+11); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := p.Poll()
@@ -1814,12 +1808,12 @@ func TestOlderMalformedPartRecoversAfterHighWaterAdvance(t *testing.T) {
 	if len(recovered) != 1 || !reflect.DeepEqual(normalizedKinds(recovered[0].Events), []model.EventKind{model.EvText}) {
 		t.Fatalf("malformed part recovery = %+v", recovered)
 	}
-	if len(at.partWatches) != 0 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("recovery watches/stats = %+v / %+v", at.partWatches, p.db.lastPoll)
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("recovered part re-emitted: %+v, %v", updates, err)
 	}
 }
 
-func TestOlderMalformedPartChangeEmitsNewNotice(t *testing.T) {
+func TestStillMalformedPartChangeEmitsNewNotice(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1831,7 +1825,7 @@ func TestOlderMalformedPartChangeEmitsNewNotice(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='malformed'`, `{"type":"text","text":false}`); err != nil {
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='malformed'`, `{"type":"text","text":false}`, base+11); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := p.Poll()
@@ -1841,12 +1835,12 @@ func TestOlderMalformedPartChangeEmitsNewNotice(t *testing.T) {
 	if len(changed) != 1 || !reflect.DeepEqual(normalizedKinds(changed[0].Events), []model.EventKind{model.EvNotice}) {
 		t.Fatalf("changed malformed notice = %+v", changed)
 	}
-	if len(p.agents[Name+":child"].partWatches) != 1 || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("changed malformed watches/stats = %+v / %+v", p.agents[Name+":child"].partWatches, p.db.lastPoll)
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("unchanged malformed part renoticed: %+v, %v", updates, err)
 	}
 }
 
-func TestNonAuthoritativeMalformedMessageRecoversAfterCursorAdvance(t *testing.T) {
+func TestNonAuthoritativeMalformedMessageRecoversAfterItChanges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1858,26 +1852,22 @@ func TestNonAuthoritativeMalformedMessageRecoversAfterCursorAdvance(t *testing.T
 	if err != nil || len(first) != 1 || !reflect.DeepEqual(normalizedKinds(first[0].Events), []model.EventKind{model.EvNotice}) {
 		t.Fatalf("initial malformed message = %+v, %v", first, err)
 	}
+	if _, err := db.Exec(`UPDATE message SET data=?,time_updated=? WHERE id='older-bad'`, `{"role":"user","agent":"recovered-agent"}`, base+11); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
 	at := p.agents[Name+":child"]
-	if len(at.messageWatches) != 2 || at.messageWatches["older-bad"] == "" || at.messageWatches["newer"] == "" {
-		t.Fatalf("malformed message watches = %+v", at.messageWatches)
+	if p.db.lastPoll.messageRows != 1 || at.roles["older-bad"] != "user" {
+		t.Fatalf("non-authoritative recovery = rows %+v roles %+v", p.db.lastPoll, at.roles)
 	}
-	if _, err := db.Exec(`UPDATE message SET data=? WHERE id='older-bad'`, `{"role":"user","agent":"recovered-agent"}`); err != nil {
-		t.Fatal(err)
-	}
-	updates, err := p.Poll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(updates) != 0 || p.lastNormalized.messageRows != 1 || at.roles["older-bad"] != "user" {
-		t.Fatalf("non-authoritative recovery = %+v normalized=%+v roles=%+v", updates, p.lastNormalized, at.roles)
-	}
-	if len(at.messageWatches) != 1 || at.messageWatches["older-bad"] != "" || at.messageWatches["newer"] == "" || p.db.lastPoll.watchQueries > 2 || p.db.lastPoll.maxQueryArgs > 2 {
-		t.Fatalf("message recovery watches/stats = %+v / %+v", at.messageWatches, p.db.lastPoll)
+	if at.agent.Status != model.StatusLive {
+		t.Fatalf("recovery changed lifecycle: %+v", at.agent)
 	}
 }
 
-func TestTerminalAgentsBecomeDormantAndReleaseRowState(t *testing.T) {
+func TestTerminalSessionsStopQueryingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1907,23 +1897,57 @@ func TestTerminalAgentsBecomeDormantAndReleaseRowState(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 2; i++ {
+		if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+			t.Fatalf("poll %d = %+v, %v", i, updates, err)
+		}
+	}
+	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("quiet sessions still queried rows: %+v", p.db.lastPoll)
+	}
 	for id, at := range p.agents {
-		if !at.dormant || at.dormantSince != base+2 || at.dormantSessionUpdated != base+2 {
-			t.Fatalf("%s not dormant at terminal cutoff: %+v", id, at)
+		if !at.quiet || at.sessionUpdated != base+2 {
+			t.Fatalf("%s not quiet at its session watermark: %+v", id, at)
 		}
-		if len(at.state) != 0 || len(at.roles) != 0 || len(at.messageWatches) != 0 || len(at.partWatches) != 0 || len(at.partMessages) != 0 || at.authority.id != "" {
-			t.Fatalf("%s retained terminal row state: %+v", id, at)
-		}
-	}
-	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
-		t.Fatalf("terminal idle poll = %+v, %v", updates, err)
-	}
-	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 || p.db.lastPoll.watchQueries != 0 {
-		t.Fatalf("terminal idle queries = %+v", p.db.lastPoll)
 	}
 }
 
-func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
+func TestQuietSweepRereadsSessionsWithoutSessionTouch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "assistant", "text", base+1, base+1, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, base+1))
+	p := New(path, 0, time.UnixMilli(base-1))
+	p.quietSweep = 1
+	for i := 0; i < 2; i++ {
+		if _, err := p.Poll(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !p.agents[Name+":child"].quiet {
+		t.Fatal("session did not settle")
+	}
+
+	// A row completing without OpenCode touching session.time_updated is still
+	// picked up, because a quiet session is re-read on a slow cadence.
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+1, base+2), base+2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	swept, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(swept) != 1 || !reflect.DeepEqual(normalizedKinds(swept[0].Events), []model.EventKind{model.EvText}) {
+		t.Fatalf("quiet sweep = %+v", swept)
+	}
+}
+
+func TestQuietSessionRehydratesAfterSessionAdvance(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1933,6 +1957,9 @@ func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
@@ -1946,14 +1973,14 @@ func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(updates) != 1 || updates[0].Agent.Status != model.StatusLive || updates[0].Agent.Backlog || !reflect.DeepEqual(normalizedKinds(updates[0].Events), []model.EventKind{model.EvUser, model.EvStatus}) {
-		t.Fatalf("dormant resume = %+v", updates)
+		t.Fatalf("resume = %+v", updates)
 	}
-	if p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 || p.agents[Name+":child"].dormant {
-		t.Fatalf("dormant resume state/stats = %+v / %+v", p.agents[Name+":child"], p.db.lastPoll)
+	if p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 {
+		t.Fatalf("resume read = %+v", p.db.lastPoll)
 	}
 }
 
-func TestTerminalAssistantErrorReleasesNoticeState(t *testing.T) {
+func TestTerminalAssistantErrorIsEmittedOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -1970,21 +1997,21 @@ func TestTerminalAssistantErrorReleasesNoticeState(t *testing.T) {
 	if len(first) != 1 || first[0].Agent.Status != model.StatusError || len(first[0].Events) != 2 || first[0].Events[0].Kind != model.EvNotice || first[0].Events[0].Body != "failed" {
 		t.Fatalf("terminal assistant error = %+v", first)
 	}
-	at := p.agents[Name+":child"]
-	if !at.dormant || len(at.state) != 0 || len(at.messageWatches) != 0 {
-		t.Fatalf("terminal assistant error retained row state: %+v", at)
+	for i := 0; i < 2; i++ {
+		if second, err := p.Poll(); err != nil || len(second) != 0 {
+			t.Fatalf("terminal error idle %d = %+v err=%v", i, second, err)
+		}
 	}
-	if second, err := p.Poll(); err != nil || len(second) != 0 || p.db.lastPoll.queryCount != 1 || p.db.lastPoll.watchQueries != 0 || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
-		t.Fatalf("terminal assistant error idle = %+v stats=%+v err=%v", second, p.db.lastPoll, err)
+	if p.db.lastPoll.queryCount != 1 {
+		t.Fatalf("terminal error session still queried rows: %+v", p.db.lastPoll)
 	}
 }
 
-func TestDormantTerminalKeepsIncompletePartWatchesUntilCompletion(t *testing.T) {
+func TestTerminalSessionEmitsLateCompletionOfIncompleteParts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
 	insertSession(t, db, "child", "parent", base)
-	insertMessage(t, db, "child", "historical", base, base, `{"role":"user"}`)
 	insertMessage(t, db, "child", "assistant", base+1, base+10, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+10))
 	insertPart(t, db, "child", "assistant", "text", base+2, base+2, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, base+2))
 	insertPart(t, db, "child", "assistant", "reason", base+3, base+3, fmt.Sprintf(`{"type":"reasoning","text":"thinking","time":{"start":%d}}`, base+3))
@@ -1996,17 +2023,17 @@ func TestDormantTerminalKeepsIncompletePartWatchesUntilCompletion(t *testing.T) 
 	if err != nil || len(first) != 1 || first[0].Agent.Status != model.StatusDone {
 		t.Fatalf("terminal poll = %+v, %v", first, err)
 	}
-	at := p.agents[Name+":child"]
-	if !at.dormant || len(at.partWatches) != 2 || len(at.partMessages) != 2 || len(at.roles) != 1 || at.roles["assistant"] != "assistant" || len(at.state) != 2 {
-		t.Fatalf("dormant incomplete context = %+v", at)
-	}
-	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.watchQueries != 1 {
-		t.Fatalf("dormant watched idle = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
-	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+2, base+11)); err != nil {
+	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"final reason","time":{"start":%d,"end":%d}}`, base+3, base+12)); err != nil {
+
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+2, base+11), base+11); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=?,time_updated=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"final reason","time":{"start":%d,"end":%d}}`, base+3, base+12), base+12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+12); err != nil {
 		t.Fatal(err)
 	}
 	completed, err := p.Poll()
@@ -2014,17 +2041,19 @@ func TestDormantTerminalKeepsIncompletePartWatchesUntilCompletion(t *testing.T) 
 		t.Fatal(err)
 	}
 	if len(completed) != 1 || !reflect.DeepEqual(normalizedKinds(completed[0].Events), []model.EventKind{model.EvText, model.EvReasoning}) || completed[0].Agent.Status != model.StatusDone {
-		t.Fatalf("dormant part completion = %+v", completed)
+		t.Fatalf("late part completion = %+v", completed)
 	}
-	if !at.dormant || len(at.partWatches) != 0 || len(at.partMessages) != 0 || len(at.roles) != 0 || len(at.state) != 0 {
-		t.Fatalf("terminal completion did not release state: %+v", at)
+	for i := 0; i < 2; i++ {
+		if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+			t.Fatalf("post-completion idle %d = %+v, %v", i, updates, err)
+		}
 	}
-	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
-		t.Fatalf("post-completion dormant idle = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
+	if p.db.lastPoll.queryCount != 1 {
+		t.Fatalf("settled session still queried rows: %+v", p.db.lastPoll)
 	}
 }
 
-func TestDormantMetadataOnlyAdvanceRefreshesWithoutReopening(t *testing.T) {
+func TestQuietSessionMetadataAdvanceRefreshesWithoutReadingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
@@ -2037,6 +2066,9 @@ func TestDormantMetadataOnlyAdvanceRefreshesWithoutReopening(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
 	metadataUpdated := base + 20
 	if _, err := db.Exec(`UPDATE session SET title='renamed',tokens_input=7,tokens_output=3,time_updated=? WHERE id='child'`, metadataUpdated); err != nil {
 		t.Fatal(err)
@@ -2046,20 +2078,13 @@ func TestDormantMetadataOnlyAdvanceRefreshesWithoutReopening(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(updates) != 1 || updates[0].Agent.Title != "renamed" || updates[0].Agent.Tokens.Total != 10 || updates[0].Agent.Updated.UnixMilli() != metadataUpdated || updates[0].Agent.Status != model.StatusDone {
-		t.Fatalf("dormant metadata refresh = %+v", updates)
+		t.Fatalf("metadata refresh = %+v", updates)
 	}
-	at := p.agents[Name+":child"]
-	if !at.dormant || at.dormantSessionUpdated != metadataUpdated || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
-		t.Fatalf("dormant metadata state/stats = %+v / %+v", at, p.db.lastPoll)
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("metadata refresh read content rows: %+v", p.db.lastPoll)
 	}
 	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
 		t.Fatalf("metadata refresh follow-up = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
-	}
-	if _, err := db.Exec(`UPDATE session SET title='stale',time_updated=? WHERE id='child'`, metadataUpdated-1); err != nil {
-		t.Fatal(err)
-	}
-	if updates, err := p.Poll(); err != nil || len(updates) != 0 || at.dormantSessionUpdated != metadataUpdated || at.agent.Title != "renamed" {
-		t.Fatalf("backdated dormant metadata = %+v state=%+v err=%v", updates, at, err)
 	}
 }
 
@@ -2084,7 +2109,7 @@ func TestDeletedSessionsAreRemovedFromProviderState(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if p.db.lastPoll.queryCount != 1 || p.db.lastPoll.watchQueries != 0 {
+	if p.db.lastPoll.queryCount != 1 {
 		t.Fatalf("deleted session query overhead = %+v", p.db.lastPoll)
 	}
 }
@@ -2111,69 +2136,31 @@ func TestMissingDatabaseDoesNotPurgeProviderState(t *testing.T) {
 	}
 }
 
-func TestDeletedWatchedRowsArePruned(t *testing.T) {
+func TestDeletedRowsDoNotBreakPolling(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)
 	base := time.Now().UnixMilli()
 	insertSession(t, db, "child", "parent", base)
 	insertMessage(t, db, "child", "assistant", base+1, base+1, `{"role":"assistant"}`)
 	insertPart(t, db, "child", "assistant", "running", base+2, base+2, `{"type":"tool","tool":"bash","state":{"status":"running","input":{}}}`)
-	insertMessage(t, db, "child", "bad-message", base+10, base+10, `{"role":42}`)
 	p := New(path, 0, time.UnixMilli(base-1))
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	at := p.agents[Name+":child"]
-	if len(at.messageWatches) != 1 || len(at.partWatches) != 1 {
-		t.Fatalf("initial watches = %+v / %+v", at.messageWatches, at.partWatches)
-	}
-	if _, err := db.Exec(`DELETE FROM message WHERE id='bad-message'; DELETE FROM part WHERE id='running'`); err != nil {
+	if _, err := db.Exec(`DELETE FROM part WHERE id='running'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Poll(); err != nil {
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+3); err != nil {
 		t.Fatal(err)
 	}
-	if len(at.messageWatches) != 0 || len(at.partWatches) != 0 || len(at.partMessages) != 0 {
-		t.Fatalf("deleted watches retained = %+v / %+v", at.messageWatches, at.partWatches)
-	}
-	if at.authority.id != "" || at.agent.Status != model.StatusLive {
-		t.Fatalf("deleted malformed authority remained stale: authority=%+v agent=%+v", at.authority, at.agent)
-	}
-	if _, err := p.Poll(); err != nil {
-		t.Fatal(err)
-	}
-	if p.db.lastPoll.watchQueries != 0 {
-		t.Fatalf("stale deleted watches still queried: %+v", p.db.lastPoll)
-	}
-}
-
-func TestWatchPayloadIsBatchedAtReasonableCap(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "opencode.db")
-	db := fixtureDB(t, path)
-	base := time.Now().UnixMilli()
-	insertSession(t, db, "child", "parent", base)
-	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
-	tx, err := db.Begin()
+	updates, err := p.Poll()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2000; i++ {
-		if _, err := tx.Exec(`INSERT INTO part VALUES (?,?,?,?,?,?)`, fmt.Sprintf("running-%04d", i), "assistant", "child", base, base, `{"type":"tool","tool":"bash","state":{"status":"running","input":{}}}`); err != nil {
-			t.Fatal(err)
+	for _, update := range updates {
+		if len(update.Events) != 0 {
+			t.Fatalf("deleted row produced events: %+v", update.Events)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	p := New(path, 0, time.UnixMilli(base-1))
-	if _, err := p.Poll(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.Poll(); err != nil {
-		t.Fatal(err)
-	}
-	if p.db.lastPoll.maxWatchPayload > maxWatchPayloadBytes || p.db.lastPoll.maxQueryArgs > 2 || p.db.lastPoll.watchQueries > 20 {
-		t.Fatalf("watch batching stats = %+v", p.db.lastPoll)
 	}
 }
 
