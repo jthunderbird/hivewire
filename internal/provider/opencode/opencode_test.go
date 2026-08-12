@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jtaylor/hivewire/internal/model"
+	"github.com/jtaylor/hivewire/internal/provider"
 	_ "modernc.org/sqlite"
 )
 
@@ -80,6 +82,28 @@ func insertSession(t *testing.T, db *sql.DB, id, parent string, created int64) {
 	) VALUES (?,?,?,?,?,?,?,?,?,?)`, id, "project", parent, "/work", id, "1.15.7", "build", "gpt-5", created, created+1); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func insertMessage(t *testing.T, db *sql.DB, sessionID, id string, created, updated int64, data string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)`, id, sessionID, created, updated, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertPart(t *testing.T, db *sql.DB, sessionID, messageID, id string, created, updated int64, data string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)`, id, messageID, sessionID, created, updated, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func updatesByNativeID(updates []provider.Update) map[string]provider.Update {
+	result := make(map[string]provider.Update, len(updates))
+	for _, update := range updates {
+		result[update.Agent.NativeID] = update
+	}
+	return result
 }
 
 func TestSQLiteFileURI(t *testing.T) {
@@ -874,6 +898,384 @@ func TestNormalizeAssistantErrorMappingPrecedence(t *testing.T) {
 				t.Fatalf("assistantError() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPollAdoptsChildrenWithDepthAndStrictBacklogActivity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	since := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	cutoff := since.UnixMilli()
+	insertSession(t, db, "root", "", cutoff-100)
+	insertSession(t, db, "before", "root", cutoff-100)
+	insertSession(t, db, "equal", "root", cutoff-100)
+	insertSession(t, db, "nested", "equal", cutoff-100)
+	insertSession(t, db, "post-activity", "root", cutoff-100)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='before'`, cutoff-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id IN ('equal','nested')`, cutoff); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "post-activity", "post-message", cutoff+1, cutoff+1, `{"role":"user"}`)
+
+	p := New(path, 0, since)
+	if p.Name() != Name || Name != "opencode" {
+		t.Fatalf("provider name = %q, constant = %q", p.Name(), Name)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := updatesByNativeID(updates)
+	if len(got) != 4 {
+		t.Fatalf("adopted IDs = %v, want four children and no root", reflect.ValueOf(got).MapKeys())
+	}
+	if !got["before"].Agent.Backlog || got["before"].Agent.Status != model.StatusDone || len(got["before"].Events) != 0 {
+		t.Fatalf("before cutoff = %+v", got["before"])
+	}
+	if got["before"].Agent.Updated.UnixMilli() != cutoff-1 || got["before"].Agent.DurationMS != 99 || got["before"].Agent.EventCount != 0 || got["before"].Agent.ToolCount != 0 {
+		t.Fatalf("deterministic backlog counts/times = %+v", got["before"].Agent)
+	}
+	for _, id := range []string{"equal", "nested", "post-activity"} {
+		if got[id].Agent.Backlog {
+			t.Fatalf("%s was incorrectly backlog: %+v", id, got[id].Agent)
+		}
+	}
+	if got["equal"].Agent.Depth != 1 || got["nested"].Agent.Depth != 2 {
+		t.Fatalf("depths direct/nested = %d/%d", got["equal"].Agent.Depth, got["nested"].Agent.Depth)
+	}
+}
+
+func TestPollStreamsMutablePhasesAndLifecycleOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Add(-time.Second).Truncate(time.Millisecond).UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "user", base+10, base+10, `{"role":"user","time":{"created":1}}`)
+	insertMessage(t, db, "child", "assistant", base+20, base+20, `{"role":"assistant","finish":"tool-calls"}`)
+	insertPart(t, db, "child", "user", "user-part", base+10, base+10, `{"type":"text","text":"run checks"}`)
+	insertPart(t, db, "child", "assistant", "text", base+30, base+30, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, base+30))
+	insertPart(t, db, "child", "assistant", "reason", base+35, base+35, fmt.Sprintf(`{"type":"reasoning","text":"thinking","time":{"start":%d}}`, base+35))
+	insertPart(t, db, "child", "assistant", "tool", base+40, base+40, fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":"running","input":{"command":"go test ./..."},"time":{"start":%d}}}`, base+40))
+
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || !reflect.DeepEqual(normalizedKinds(first[0].Events), []model.EventKind{model.EvUser, model.EvToolUse}) {
+		t.Fatalf("first poll = %+v", first)
+	}
+	if first[0].Agent.Status != model.StatusLive || first[0].Agent.ToolCount != 1 || first[0].Agent.EventCount != 2 {
+		t.Fatalf("first agent counts/status = %+v", first[0].Agent)
+	}
+
+	completed := base + 100
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+30, base+60)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"thought","time":{"start":%d,"end":%d}}`, base+35, base+65)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='tool'`, fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok","time":{"start":%d,"end":%d}}}`, base+40, base+70)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE message SET data=? WHERE id='assistant'`, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, completed)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKinds := []model.EventKind{model.EvText, model.EvReasoning, model.EvToolResult, model.EvStatus}
+	if len(second) != 1 || !reflect.DeepEqual(normalizedKinds(second[0].Events), wantKinds) {
+		t.Fatalf("completion poll kinds = %v, want %v", normalizedKinds(second[0].Events), wantKinds)
+	}
+	statusEvent := second[0].Events[len(second[0].Events)-1]
+	if statusEvent.TS.UnixMilli() != completed || second[0].Agent.Status != model.StatusDone || second[0].Agent.EventCount != 6 {
+		t.Fatalf("completion status/count = %+v, event=%+v", second[0].Agent, statusEvent)
+	}
+	if second[0].Agent.Updated.UnixMilli() != base+40 || second[0].Agent.DurationMS != 40 {
+		t.Fatalf("deterministic updated/duration = %v/%d", second[0].Agent.Updated, second[0].Agent.DurationMS)
+	}
+	third, err := p.Poll()
+	if err != nil || len(third) != 0 {
+		t.Fatalf("repeated poll = %+v, %v", third, err)
+	}
+
+	insertMessage(t, db, "child", "resumed-user", base+200, base+200, `{"role":"user"}`)
+	insertPart(t, db, "child", "resumed-user", "resumed-text", base+200, base+200, `{"type":"text","text":"continue"}`)
+	resumed, err := p.Poll()
+	if err != nil || len(resumed) != 1 {
+		t.Fatalf("resumed poll = %+v, %v", resumed, err)
+	}
+	if resumed[0].Agent.Status != model.StatusLive || resumed[0].Agent.Backlog {
+		t.Fatalf("resumed agent = %+v", resumed[0].Agent)
+	}
+	if kinds := normalizedKinds(resumed[0].Events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvUser, model.EvStatus}) {
+		t.Fatalf("resumed events = %v", kinds)
+	}
+}
+
+func TestPollNewestMessageLifecycleVariants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Add(-time.Second).Truncate(time.Millisecond).UnixMilli()
+	tests := []struct {
+		id, data string
+		want     model.Status
+	}{
+		{"stop", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+100), model.StatusDone},
+		{"length", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"length"}`, base+101), model.StatusDone},
+		{"unknown", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"unknown"}`, base+102), model.StatusDone},
+		{"finish-error", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"error"}`, base+103), model.StatusError},
+		{"filter", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"content-filter"}`, base+104), model.StatusError},
+		{"object-error", fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop","error":{"message":"bad"}}`, base+105), model.StatusError},
+		{"tool-calls", `{"role":"assistant","finish":"tool-calls"}`, model.StatusLive},
+		{"user", `{"role":"user"}`, model.StatusLive},
+		{"incomplete", `{"role":"assistant"}`, model.StatusLive},
+		{"malformed", `{"role":`, model.StatusLive},
+	}
+	for i, tt := range tests {
+		created := base + int64(i)
+		insertSession(t, db, tt.id, "parent", base)
+		insertMessage(t, db, tt.id, tt.id+"-old", created-1, created-1, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+50))
+		insertMessage(t, db, tt.id, tt.id+"-new", created, created, tt.data)
+	}
+
+	updates, err := New(path, 0, time.UnixMilli(base-1)).Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := updatesByNativeID(updates)
+	for _, tt := range tests {
+		u := got[tt.id]
+		if u.Agent.Status != tt.want {
+			t.Errorf("%s status = %q, want %q", tt.id, u.Agent.Status, tt.want)
+		}
+		statusCount := 0
+		for _, event := range u.Events {
+			if event.Kind == model.EvStatus {
+				statusCount++
+			}
+		}
+		wantStatusEvents := 0
+		if tt.want != model.StatusLive {
+			wantStatusEvents = 1
+		}
+		if statusCount != wantStatusEvents {
+			t.Errorf("%s status events = %d, want %d: %+v", tt.id, statusCount, wantStatusEvents, u.Events)
+		}
+	}
+}
+
+func TestBacklogResumesWithoutReplayingExistingRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	since := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	old := since.Add(-time.Second).UnixMilli()
+	insertSession(t, db, "child", "parent", old)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, old); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "old-user", old-2, old-2, `{"role":"user","agent":"build","model":{"modelID":"gpt-5"}}`)
+	insertPart(t, db, "child", "old-user", "old-prompt", old-2, old-2, `{"type":"text","text":"historical prompt"}`)
+	insertMessage(t, db, "child", "old-message", old, old, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "old-message", "old-text", old, old, fmt.Sprintf(`{"type":"text","text":"old draft","time":{"start":%d}}`, old))
+	insertPart(t, db, "child", "old-message", "old-tool", old, old, fmt.Sprintf(`{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"a"},"output":"ok","time":{"start":%d,"end":%d}}}`, old, old))
+
+	p := New(path, 0, since)
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 || !first[0].Agent.Backlog || len(first[0].Events) != 0 {
+		t.Fatalf("initial backlog = %+v, %v", first, err)
+	}
+	if first[0].Agent.Prompt != "historical prompt" || first[0].Agent.Model != "gpt-5" || first[0].Agent.ToolCount != 1 || first[0].Agent.EventCount != 3 {
+		t.Fatalf("backlog metadata/counts = %+v", first[0].Agent)
+	}
+	unchanged, err := p.Poll()
+	if err != nil || len(unchanged) != 0 {
+		t.Fatalf("unchanged backlog poll = %+v, %v", unchanged, err)
+	}
+	if _, err := db.Exec(`UPDATE part SET time_updated=?,data=? WHERE id='old-text'`, since.UnixMilli()+1, fmt.Sprintf(`{"type":"text","text":"old final","time":{"start":%d,"end":%d}}`, old, since.UnixMilli()+1)); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "new-user", since.UnixMilli()+2, since.UnixMilli()+2, `{"role":"user"}`)
+	insertPart(t, db, "child", "new-user", "new-text", since.UnixMilli()+2, since.UnixMilli()+2, `{"type":"text","text":"continue"}`)
+	second, err := p.Poll()
+	if err != nil || len(second) != 1 {
+		t.Fatalf("resume = %+v, %v", second, err)
+	}
+	if second[0].Agent.Backlog || second[0].Agent.Status != model.StatusLive {
+		t.Fatalf("resumed agent = %+v", second[0].Agent)
+	}
+	if second[0].Agent.ToolCount != 1 || second[0].Agent.EventCount != 5 {
+		t.Fatalf("resumed counts = %+v", second[0].Agent)
+	}
+	if kinds := normalizedKinds(second[0].Events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvUser, model.EvStatus}) {
+		t.Fatalf("resume events = %v, want only new user and live status", kinds)
+	}
+}
+
+func TestPollIdleFallbackAndMalformedNoticeOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Add(-time.Second).Truncate(time.Millisecond)
+	insertSession(t, db, "child", "parent", base.UnixMilli())
+	insertMessage(t, db, "child", "bad", base.UnixMilli()+1, base.UnixMilli()+1, `{"role":`)
+	p := New(path, 100*time.Millisecond, base.Add(-time.Second))
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 {
+		t.Fatalf("idle poll = %+v, %v", first, err)
+	}
+	if first[0].Agent.Status != model.StatusDone || first[0].Agent.DurationMS != 1 {
+		t.Fatalf("idle agent = %+v", first[0].Agent)
+	}
+	if kinds := normalizedKinds(first[0].Events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvNotice, model.EvStatus}) {
+		t.Fatalf("idle/malformed events = %v", kinds)
+	}
+	if got := first[0].Events[1].TS; !got.Equal(base.Add(time.Millisecond + 100*time.Millisecond)) {
+		t.Fatalf("idle status time = %v", got)
+	}
+	second, err := p.Poll()
+	if err != nil || len(second) != 0 {
+		t.Fatalf("repeated malformed/idle poll = %+v, %v", second, err)
+	}
+}
+
+func TestPollDatabaseRecoveryReplacementAndBusyTimeout(t *testing.T) {
+	t.Run("missing and corrupt recovery", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "opencode.db")
+		p := New(path, 0, time.Time{})
+		if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+			t.Fatalf("missing poll = %+v, %v", updates, err)
+		}
+		if err := os.WriteFile(path, []byte("not sqlite"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Poll(); err == nil {
+			t.Fatal("corrupt database poll succeeded")
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		db := fixtureDB(t, path)
+		insertSession(t, db, "recovered", "parent", time.Now().UnixMilli())
+		if updates, err := p.Poll(); err != nil || len(updates) != 1 || updates[0].Agent.NativeID != "recovered" {
+			t.Fatalf("recovery poll = %+v, %v", updates, err)
+		}
+	})
+
+	t.Run("valid open replacement", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "opencode.db")
+		db := fixtureDB(t, path)
+		insertSession(t, db, "old", "parent", time.Now().UnixMilli())
+		p := New(path, 0, time.Time{})
+		if updates, err := p.Poll(); err != nil || len(updates) != 1 {
+			t.Fatalf("initial poll = %+v, %v", updates, err)
+		}
+		replacementPath := filepath.Join(dir, "replacement.db")
+		replacement := fixtureDB(t, replacementPath)
+		insertSession(t, replacement, "new", "parent", time.Now().UnixMilli())
+		if err := replacement.Close(); err != nil {
+			t.Fatal(err)
+		}
+		oldPath := filepath.Join(dir, "old.db")
+		if err := os.Rename(path, oldPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacementPath, path); err != nil {
+			t.Fatal(err)
+		}
+		if updates, err := p.Poll(); err != nil || len(updates) != 1 || updates[0].Agent.NativeID != "new" {
+			t.Fatalf("replacement poll = %+v, %v", updates, err)
+		}
+	})
+
+	t.Run("busy timeout recovers", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "opencode.db")
+		db := fixtureDB(t, path)
+		insertSession(t, db, "child", "parent", time.Now().UnixMilli())
+		if _, err := db.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := conn.ExecContext(context.Background(), `BEGIN EXCLUSIVE`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(context.Background(), `UPDATE session SET title='locked' WHERE id='child'`); err != nil {
+			t.Fatal(err)
+		}
+		p := New(path, 0, time.Time{})
+		start := time.Now()
+		if _, err := p.Poll(); err == nil {
+			t.Fatal("poll under exclusive writer lock succeeded")
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("busy timeout took %v", elapsed)
+		}
+		if _, err := conn.ExecContext(context.Background(), `ROLLBACK`); err != nil {
+			t.Fatal(err)
+		}
+		if updates, err := p.Poll(); err != nil || len(updates) != 1 {
+			t.Fatalf("post-lock recovery = %+v, %v", updates, err)
+		}
+	})
+}
+
+func TestLargeBacklogPollIsEventlessAndBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	old := time.Now().Add(-time.Hour).UnixMilli()
+	insertSession(t, db, "child", "parent", old)
+	insertMessage(t, db, "child", "assistant", old, old, `{"role":"assistant","time":{"completed":1},"finish":"stop"}`)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5000; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("part-%05d", i), "assistant", "child", old, old, `{"type":"text","text":"historical","time":{"end":1}}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct {
+		updates []provider.Update
+		err     error
+	}, 1)
+	go func() {
+		updates, err := New(path, 0, time.Now()).Poll()
+		done <- struct {
+			updates []provider.Update
+			err     error
+		}{updates, err}
+	}()
+	select {
+	case result := <-done:
+		if result.err != nil || len(result.updates) != 1 || len(result.updates[0].Events) != 0 {
+			t.Fatalf("large backlog = %+v, %v", result.updates, result.err)
+		}
+		if result.updates[0].Agent.EventCount != 5000 {
+			t.Fatalf("backlog EventCount = %d, want 5000", result.updates[0].Agent.EventCount)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("large backlog poll exceeded five seconds")
 	}
 }
 
