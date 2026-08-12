@@ -24,9 +24,15 @@ type emittedPart struct {
 type normalizedSession struct {
 	agent      model.Agent
 	events     []model.Event
+	eventCount int
 	state      map[string]emittedPart
 	status     model.Status
 	statusTime time.Time
+}
+
+type normalizationStats struct {
+	eventGroups int
+	toolBodies  int
 }
 
 type messageData struct {
@@ -78,6 +84,10 @@ type eventGroup struct {
 }
 
 func normalizeSession(session sessionRow, sessions []sessionRow, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart) (normalizedSession, error) {
+	return normalizeSessionMode(session, sessions, messages, parts, source, prior, true, nil)
+}
+
+func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart, emitEvents bool, stats *normalizationStats) (normalizedSession, error) {
 	depth, err := sessionDepth(session, sessions)
 	if err != nil {
 		return normalizedSession{}, err
@@ -135,9 +145,13 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 			if authoritative {
 				newestMalformed = true
 			}
-			notice := malformedNotice(result.agent.ID, "message", row.id, err, row.timeUpdated, row.timeCreated)
 			if state.malformed != fingerprint {
-				groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+				result.eventCount++
+				if emitEvents {
+					notice := malformedNotice(result.agent.ID, "message", row.id, err, row.timeUpdated, row.timeCreated)
+					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+					recordEventGroup(stats)
+				}
 				state.malformed = fingerprint
 			}
 			result.state[row.id] = state
@@ -157,23 +171,27 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 		if authoritative {
 			newestData = data
 		}
-		if len(data.Error) > 0 && string(data.Error) != "null" {
-			body := assistantError(data.Error)
+		if data.Role == "assistant" && len(data.Error) > 0 && string(data.Error) != "null" {
 			if state.malformed != fingerprint {
-				groups = append(groups, eventGroup{
-					effective: firstPositive(data.Time.Completed, row.timeUpdated, row.timeCreated),
-					created:   row.timeCreated,
-					rowID:     row.id,
-					events: []model.Event{{
-						AgentID: result.agent.ID,
-						TS:      unixMillis(firstPositive(data.Time.Completed, row.timeUpdated, row.timeCreated)),
-						Kind:    model.EvNotice,
-						Header:  provider.FirstLine(body, 160),
-						Body:    body,
-						Lines:   provider.CountLines(body),
-						Err:     true,
-					}},
-				})
+				result.eventCount++
+				if emitEvents {
+					body := assistantError(data.Error)
+					groups = append(groups, eventGroup{
+						effective: firstPositive(data.Time.Completed, row.timeUpdated, row.timeCreated),
+						created:   row.timeCreated,
+						rowID:     row.id,
+						events: []model.Event{{
+							AgentID: result.agent.ID,
+							TS:      unixMillis(firstPositive(data.Time.Completed, row.timeUpdated, row.timeCreated)),
+							Kind:    model.EvNotice,
+							Header:  provider.FirstLine(body, 160),
+							Body:    body,
+							Lines:   provider.CountLines(body),
+							Err:     true,
+						}},
+					})
+					recordEventGroup(stats)
+				}
 				state.malformed = fingerprint
 			}
 		}
@@ -196,9 +214,13 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 
 		var header partHeader
 		if err := json.Unmarshal([]byte(row.data), &header); err != nil {
-			notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
 			if state.malformed != fingerprint {
-				groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+				result.eventCount++
+				if emitEvents {
+					notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
+					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+					recordEventGroup(stats)
+				}
 				state.malformed = fingerprint
 			}
 			result.state[row.id] = state
@@ -211,9 +233,13 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 
 		var data partData
 		if err := json.Unmarshal([]byte(row.data), &data); err != nil {
-			notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
 			if state.malformed != fingerprint {
-				groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+				result.eventCount++
+				if emitEvents {
+					notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
+					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+					recordEventGroup(stats)
+				}
 				state.malformed = fingerprint
 			}
 			result.state[row.id] = state
@@ -229,73 +255,107 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 						result.agent.Prompt = provider.Clip(data.Text, 4000)
 					}
 					if !state.user {
-						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvUser, data.Text))
+						result.eventCount++
+						if emitEvents {
+							groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvUser, data.Text))
+							recordEventGroup(stats)
+						}
 						state.user = true
 					}
 				}
 			} else if hasMessage && message.Role == "assistant" && data.Time.End != nil && strings.TrimSpace(data.Text) != "" {
 				if !state.textDone {
-					groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvText, data.Text))
+					result.eventCount++
+					if emitEvents {
+						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvText, data.Text))
+						recordEventGroup(stats)
+					}
 				}
+				state.textDone = true
+			}
+			if !emitEvents {
+				state.user = true
 				state.textDone = true
 			}
 
 		case "reasoning":
 			if hasMessage && message.Role == "assistant" && data.Time.End != nil && strings.TrimSpace(data.Text) != "" {
 				if !state.reasoningDone {
-					groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvReasoning, data.Text))
+					result.eventCount++
+					if emitEvents {
+						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvReasoning, data.Text))
+						recordEventGroup(stats)
+					}
 				}
+				state.reasoningDone = true
+			}
+			if !emitEvents {
 				state.reasoningDone = true
 			}
 
 		case "tool":
 			useTS := firstPositive(data.State.Time.Start, row.timeCreated)
-			body := provider.PrettyJSON(data.State.Input)
-			use := model.Event{
-				AgentID: result.agent.ID,
-				TS:      unixMillis(useTS),
-				Kind:    model.EvToolUse,
-				Tool:    data.Tool,
-				Header:  provider.ToolHeader(data.Tool, data.State.Input),
-				Body:    body,
-				Lines:   provider.CountLines(body),
-			}
 			terminal := data.State.Status == "completed" || data.State.Status == "error" || data.State.Status == "errored"
+			emitUse := !state.toolUse
+			emitResult := terminal && !state.toolResult
 			var events []model.Event
 			groupTime := useTS
-			if !state.toolUse {
-				events = append(events, use)
+			if emitUse {
+				result.eventCount++
+				if emitEvents {
+					body := provider.PrettyJSON(data.State.Input)
+					if stats != nil {
+						stats.toolBodies++
+					}
+					events = append(events, model.Event{
+						AgentID: result.agent.ID,
+						TS:      unixMillis(useTS),
+						Kind:    model.EvToolUse,
+						Tool:    data.Tool,
+						Header:  provider.ToolHeader(data.Tool, data.State.Input),
+						Body:    body,
+						Lines:   provider.CountLines(body),
+					})
+				}
 				state.toolUse = true
 			}
-			if terminal && !state.toolResult {
+			if emitResult {
+				result.eventCount++
 				isError := data.State.Status == "error" || data.State.Status == "errored"
-				resultBody := data.State.Output
-				if isError {
-					resultBody = data.State.Error
-				}
-				head := provider.FirstLine(resultBody, 160)
-				if head == "" {
-					head = "(no output)"
-				}
 				resultTS := firstPositive(derefMillis(data.State.Time.End), row.timeUpdated, row.timeCreated)
-				events = append(events, model.Event{
-					AgentID:  result.agent.ID,
-					TS:       unixMillis(resultTS),
-					Kind:     model.EvToolResult,
-					Tool:     data.Tool,
-					Header:   head,
-					Body:     resultBody,
-					Lines:    provider.CountLines(resultBody),
-					Err:      isError,
-					Overflow: provider.DetectOverflow(resultBody),
-				})
+				if emitEvents {
+					resultBody := data.State.Output
+					if isError {
+						resultBody = data.State.Error
+					}
+					head := provider.FirstLine(resultBody, 160)
+					if head == "" {
+						head = "(no output)"
+					}
+					events = append(events, model.Event{
+						AgentID:  result.agent.ID,
+						TS:       unixMillis(resultTS),
+						Kind:     model.EvToolResult,
+						Tool:     data.Tool,
+						Header:   head,
+						Body:     resultBody,
+						Lines:    provider.CountLines(resultBody),
+						Err:      isError,
+						Overflow: provider.DetectOverflow(resultBody),
+					})
+				}
 				state.toolResult = true
 				if len(events) == 1 {
 					groupTime = resultTS
 				}
 			}
+			if !emitEvents {
+				state.toolUse = true
+				state.toolResult = true
+			}
 			if len(events) > 0 {
 				groups = append(groups, eventGroup{effective: groupTime, created: row.timeCreated, rowID: row.id, events: events})
+				recordEventGroup(stats)
 			}
 		}
 		result.state[row.id] = state
@@ -354,6 +414,12 @@ func sessionDepth(session sessionRow, sessions []sessionRow) (int, error) {
 	return depth, nil
 }
 
+func recordEventGroup(stats *normalizationStats) {
+	if stats != nil {
+		stats.eventGroups++
+	}
+}
+
 func textGroup(agentID string, row partRow, start int64, kind model.EventKind, body string) eventGroup {
 	ts := firstPositive(start, row.timeCreated)
 	return eventGroup{
@@ -405,11 +471,14 @@ func assistantError(raw json.RawMessage) string {
 }
 
 func messageStatus(row messageRow, data messageData) (model.Status, time.Time) {
+	if data.Role != "assistant" {
+		return model.StatusLive, unixMillis(firstPositive(row.timeUpdated, row.timeCreated))
+	}
 	ts := firstPositive(data.Time.Completed, row.timeUpdated, row.timeCreated)
 	if len(data.Error) > 0 && string(data.Error) != "null" || data.Finish == "error" || data.Finish == "content-filter" {
 		return model.StatusError, unixMillis(ts)
 	}
-	if data.Role == "assistant" && data.Time.Completed > 0 {
+	if data.Time.Completed > 0 {
 		switch data.Finish {
 		case "stop", "length", "unknown":
 			return model.StatusDone, unixMillis(ts)

@@ -3,7 +3,6 @@ package opencode
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/jtaylor/hivewire/internal/model"
@@ -54,22 +53,24 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 		if exists {
 			prior = at.state
 		}
-		normalized, err := normalizeSession(
+		activity := sessionActivity(session, snapshot.messages[session.id], snapshot.parts[session.id])
+		backlog := !exists && activity.Before(p.since)
+		if exists && at.agent.Backlog {
+			backlog = activity.Before(p.since)
+		}
+
+		normalized, err := normalizeSessionMode(
 			session,
 			snapshot.sessions,
 			snapshot.messages[session.id],
 			snapshot.parts[session.id],
 			p.db.path,
 			prior,
+			!backlog,
+			nil,
 		)
 		if err != nil {
 			return nil, err
-		}
-
-		activity := sessionActivity(session, snapshot.messages[session.id], snapshot.parts[session.id])
-		backlog := !exists && activity.Before(p.since)
-		if exists && at.agent.Backlog {
-			backlog = activity.Before(p.since)
 		}
 
 		events := normalized.events
@@ -79,12 +80,7 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 			if exists {
 				normalized.agent.EventCount = at.agent.EventCount
 			}
-			normalized.agent.EventCount += len(events)
-			normalized.state = suppressExistingRows(
-				normalized.state,
-				snapshot.messages[session.id],
-				snapshot.parts[session.id],
-			)
+			normalized.agent.EventCount += normalized.eventCount
 			events = nil
 		} else {
 			previousStatus := model.StatusLive
@@ -136,37 +132,6 @@ func sessionActivity(session sessionRow, messages []messageRow, parts []partRow)
 		activity = laterTime(activity, unixMillis(maxMillis(row.timeCreated, row.timeUpdated)))
 	}
 	return activity
-}
-
-func suppressExistingRows(state map[string]emittedPart, messages []messageRow, parts []partRow) map[string]emittedPart {
-	for _, row := range messages {
-		emitted := state[row.id]
-		if emitted.malformed == "" {
-			emitted.malformed = emitted.fingerprint
-		}
-		state[row.id] = emitted
-	}
-	for _, row := range parts {
-		emitted := state[row.id]
-		var header partHeader
-		if err := json.Unmarshal([]byte(row.data), &header); err == nil {
-			switch header.Type {
-			case "text":
-				emitted.user = true
-				emitted.textDone = true
-			case "reasoning":
-				emitted.reasoningDone = true
-			case "tool":
-				emitted.toolUse = true
-				emitted.toolResult = true
-			}
-		}
-		if emitted.malformed == "" {
-			emitted.malformed = emitted.fingerprint
-		}
-		state[row.id] = emitted
-	}
-	return state
 }
 
 func statusEvent(agentID string, status model.Status, ts time.Time) model.Event {

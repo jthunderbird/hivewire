@@ -883,6 +883,25 @@ func TestNormalizeAssistantErrorPrecedenceAndMalformedDedup(t *testing.T) {
 	}
 }
 
+func TestNormalizeUserErrorFieldsDoNotEndSessionOrEmitAssistantNotice(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "assistant", timeCreated: 10, timeUpdated: 11, data: `{"role":"assistant","time":{"completed":11},"finish":"stop"}`},
+		{id: "user", timeCreated: 20, timeUpdated: 21, data: `{"role":"user","time":{"completed":25},"finish":"error","error":{"message":"user payload"}}`},
+	}
+
+	got, err := normalizeSession(session, []sessionRow{session}, messages, nil, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.status != model.StatusLive || got.statusTime.UnixMilli() != 21 {
+		t.Fatalf("newest user status = %q at %v, want live at persisted update", got.status, got.statusTime)
+	}
+	if len(got.events) != 0 {
+		t.Fatalf("user error-like fields emitted events: %+v", got.events)
+	}
+}
+
 func TestNormalizeAssistantErrorMappingPrecedence(t *testing.T) {
 	tests := []struct {
 		name, raw, want string
@@ -1114,6 +1133,52 @@ func TestBacklogResumesWithoutReplayingExistingRows(t *testing.T) {
 	}
 	if kinds := normalizedKinds(second[0].Events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvUser, model.EvStatus}) {
 		t.Fatalf("resume events = %v, want only new user and live status", kinds)
+	}
+}
+
+func TestBacklogNormalizationSkipsHistoricalEventConstruction(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", model: "gpt-5", timeCreated: 1, timeUpdated: 2}
+	messages := []messageRow{
+		{id: "user", sessionID: "child", timeCreated: 3, timeUpdated: 3, data: `{"role":"user"}`},
+		{id: "assistant", sessionID: "child", timeCreated: 4, timeUpdated: 4, data: `{"role":"assistant","time":{"completed":5},"finish":"stop"}`},
+	}
+	parts := []partRow{{
+		id: "prompt", messageID: "user", sessionID: "child", timeCreated: 3, timeUpdated: 3,
+		data: `{"type":"text","text":"historical prompt"}`,
+	}}
+	for i := 0; i < 2000; i++ {
+		parts = append(parts, partRow{
+			id: fmt.Sprintf("tool-%04d", i), messageID: "assistant", sessionID: "child",
+			timeCreated: int64(10 + i), timeUpdated: int64(10 + i),
+			data: `{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"printf a-large-historical-command"},"output":"large historical output"}}`,
+		})
+	}
+
+	var stats normalizationStats
+	got, err := normalizeSessionMode(session, []sessionRow{session}, messages, parts, "db", nil, false, &stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.events) != 0 || stats.eventGroups != 0 || stats.toolBodies != 0 {
+		t.Fatalf("metadata mode constructed events: events=%d stats=%+v", len(got.events), stats)
+	}
+	if got.agent.Prompt != "historical prompt" || got.agent.ToolCount != 2000 || got.eventCount != 4001 {
+		t.Fatalf("metadata mode agent/counts = %+v, eventCount=%d", got.agent, got.eventCount)
+	}
+	for _, row := range parts[1:] {
+		state := got.state[row.id]
+		if !state.toolUse || !state.toolResult {
+			t.Fatalf("historical tool phases not preseeded for %s: %+v", row.id, state)
+		}
+	}
+
+	var activeStats normalizationStats
+	active, err := normalizeSessionMode(session, []sessionRow{session}, messages, parts, "db", nil, true, &activeStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.events) != 4001 || activeStats.eventGroups != 2001 || activeStats.toolBodies != 2000 {
+		t.Fatalf("event instrumentation calibration failed: events=%d stats=%+v", len(active.events), activeStats)
 	}
 }
 
