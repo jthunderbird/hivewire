@@ -73,7 +73,9 @@ func Clip(s string, max int) string {
 }
 
 // ToolHeader builds the one-line summary shown for a tool invocation, using
-// per-tool knowledge of which argument actually matters.
+// per-tool knowledge of which argument actually matters. Names are matched
+// case-insensitively because the CLIs disagree on capitalization for what is
+// otherwise the same tool: Claude Code writes "Bash", OpenCode writes "bash".
 func ToolHeader(tool string, input map[string]any) string {
 	str := func(k string) string {
 		if v, ok := input[k].(string); ok {
@@ -82,32 +84,42 @@ func ToolHeader(tool string, input map[string]any) string {
 		return ""
 	}
 	var detail string
-	switch tool {
-	case "Bash", "BashOutput":
+	switch strings.ToLower(tool) {
+	case "bash", "bashoutput":
 		detail = str("command")
 		if d := str("description"); d != "" && detail == "" {
 			detail = d
 		}
-	case "Read", "Write", "NotebookEdit":
+	case "read", "write", "notebookedit":
 		detail = str("file_path")
-	case "Edit":
+		if detail == "" {
+			detail = str("filePath")
+		}
+	case "edit":
 		detail = str("file_path")
+		if detail == "" {
+			detail = str("filePath")
+		}
 		if old := str("old_string"); old != "" {
 			detail += "  ← " + FirstLine(old, 40)
+		} else if old := str("oldString"); old != "" {
+			detail += "  ← " + FirstLine(old, 40)
 		}
-	case "Grep":
+	case "grep":
 		detail = str("pattern")
 		if p := str("path"); p != "" {
 			detail += "  in " + p
 		}
-	case "Glob":
+	case "glob":
 		detail = str("pattern")
-	case "Agent", "Task":
+	case "agent", "task":
 		detail = str("description")
-	case "WebFetch", "WebSearch":
+	case "webfetch", "websearch", "codesearch":
 		detail = str("url") + str("query")
-	case "Skill":
-		detail = str("skill") + " " + str("args")
+	case "skill":
+		detail = strings.TrimSpace(str("skill") + str("name") + " " + str("args"))
+	case "apply_patch":
+		detail = FirstLine(str("patchText"), 120)
 	default:
 		if b, err := json.Marshal(input); err == nil {
 			detail = string(b)
