@@ -64,6 +64,7 @@ type rowCursor struct {
 
 type pollRequest struct {
 	skip           bool
+	skipRows       bool
 	updatedSince   int64
 	messages       rowCursor
 	parts          rowCursor
@@ -170,15 +171,17 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		if args > d.lastPoll.maxQueryArgs {
 			d.lastPoll.maxQueryArgs = args
 		}
-		result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.updatedSince, req.messages)
-		d.lastPoll.queryCount++
-		if err != nil {
-			return dbSnapshot{}, err
-		}
-		result.parts[session.id], err = queryPartsIncremental(ctx, tx, session.id, req.updatedSince, req.parts)
-		d.lastPoll.queryCount++
-		if err != nil {
-			return dbSnapshot{}, err
+		if !req.skipRows {
+			result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.updatedSince, req.messages)
+			d.lastPoll.queryCount++
+			if err != nil {
+				return dbSnapshot{}, err
+			}
+			result.parts[session.id], err = queryPartsIncremental(ctx, tx, session.id, req.updatedSince, req.parts)
+			d.lastPoll.queryCount++
+			if err != nil {
+				return dbSnapshot{}, err
+			}
 		}
 		if len(req.messageWatches) > 0 {
 			rows, missing, err := d.queryMessageWatches(ctx, tx, session.id, req.messageWatches)
@@ -240,6 +243,10 @@ func (d *database) queryPartWatches(ctx context.Context, tx *sql.Tx, sessionID s
 				result = append(result, row)
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
 		if err := rows.Close(); err != nil {
 			return nil, nil, err
 		}
@@ -273,6 +280,10 @@ func (d *database) queryMessageWatches(ctx context.Context, tx *sql.Tx, sessionI
 			if rowFingerprint(row.data) != fingerprint {
 				result = append(result, row)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, nil, err
 		}
 		if err := rows.Close(); err != nil {
 			return nil, nil, err

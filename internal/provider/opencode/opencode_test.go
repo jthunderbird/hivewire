@@ -1911,7 +1911,7 @@ func TestTerminalAgentsBecomeDormantAndReleaseRowState(t *testing.T) {
 		if !at.dormant || at.dormantSince != base+2 || at.dormantSessionUpdated != base+2 {
 			t.Fatalf("%s not dormant at terminal cutoff: %+v", id, at)
 		}
-		if len(at.state) != 0 || len(at.roles) != 0 || len(at.messageWatches) != 0 || len(at.partWatches) != 0 || at.authority.id != "" {
+		if len(at.state) != 0 || len(at.roles) != 0 || len(at.messageWatches) != 0 || len(at.partWatches) != 0 || len(at.partMessages) != 0 || at.authority.id != "" {
 			t.Fatalf("%s retained terminal row state: %+v", id, at)
 		}
 	}
@@ -1950,6 +1950,90 @@ func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
 	}
 	if p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 || p.agents[Name+":child"].dormant {
 		t.Fatalf("dormant resume state/stats = %+v / %+v", p.agents[Name+":child"], p.db.lastPoll)
+	}
+}
+
+func TestDormantTerminalKeepsIncompletePartWatchesUntilCompletion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "historical", base, base, `{"role":"user"}`)
+	insertMessage(t, db, "child", "assistant", base+1, base+10, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+10))
+	insertPart(t, db, "child", "assistant", "text", base+2, base+2, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, base+2))
+	insertPart(t, db, "child", "assistant", "reason", base+3, base+3, fmt.Sprintf(`{"type":"reasoning","text":"thinking","time":{"start":%d}}`, base+3))
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+10); err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil || len(first) != 1 || first[0].Agent.Status != model.StatusDone {
+		t.Fatalf("terminal poll = %+v, %v", first, err)
+	}
+	at := p.agents[Name+":child"]
+	if !at.dormant || len(at.partWatches) != 2 || len(at.partMessages) != 2 || len(at.roles) != 1 || at.roles["assistant"] != "assistant" || len(at.state) != 2 {
+		t.Fatalf("dormant incomplete context = %+v", at)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.watchQueries != 1 {
+		t.Fatalf("dormant watched idle = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, base+2, base+11)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='reason'`, fmt.Sprintf(`{"type":"reasoning","text":"final reason","time":{"start":%d,"end":%d}}`, base+3, base+12)); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(completed) != 1 || !reflect.DeepEqual(normalizedKinds(completed[0].Events), []model.EventKind{model.EvText, model.EvReasoning}) || completed[0].Agent.Status != model.StatusDone {
+		t.Fatalf("dormant part completion = %+v", completed)
+	}
+	if !at.dormant || len(at.partWatches) != 0 || len(at.partMessages) != 0 || len(at.roles) != 0 || len(at.state) != 0 {
+		t.Fatalf("terminal completion did not release state: %+v", at)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
+		t.Fatalf("post-completion dormant idle = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
+	}
+}
+
+func TestDormantMetadataOnlyAdvanceRefreshesWithoutReopening(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "done", base+1, base+2, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+2))
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+2); err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	metadataUpdated := base + 20
+	if _, err := db.Exec(`UPDATE session SET title='renamed',tokens_input=7,tokens_output=3,time_updated=? WHERE id='child'`, metadataUpdated); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 || updates[0].Agent.Title != "renamed" || updates[0].Agent.Tokens.Total != 10 || updates[0].Agent.Updated.UnixMilli() != metadataUpdated || updates[0].Agent.Status != model.StatusDone {
+		t.Fatalf("dormant metadata refresh = %+v", updates)
+	}
+	at := p.agents[Name+":child"]
+	if !at.dormant || at.dormantSessionUpdated != metadataUpdated || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("dormant metadata state/stats = %+v / %+v", at, p.db.lastPoll)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.queryCount != 1 {
+		t.Fatalf("metadata refresh follow-up = %+v stats=%+v err=%v", updates, p.db.lastPoll, err)
+	}
+	if _, err := db.Exec(`UPDATE session SET title='stale',time_updated=? WHERE id='child'`, metadataUpdated-1); err != nil {
+		t.Fatal(err)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || at.dormantSessionUpdated != metadataUpdated || at.agent.Title != "renamed" {
+		t.Fatalf("backdated dormant metadata = %+v state=%+v err=%v", updates, at, err)
 	}
 }
 
@@ -2023,7 +2107,7 @@ func TestDeletedWatchedRowsArePruned(t *testing.T) {
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
-	if len(at.messageWatches) != 0 || len(at.partWatches) != 0 {
+	if len(at.messageWatches) != 0 || len(at.partWatches) != 0 || len(at.partMessages) != 0 {
 		t.Fatalf("deleted watches retained = %+v / %+v", at.messageWatches, at.partWatches)
 	}
 	if at.authority.id != "" || at.agent.Status != model.StatusLive {
