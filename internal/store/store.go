@@ -19,21 +19,28 @@ import (
 
 // Record is one indexed agent run.
 type Record struct {
-	ID       string       `json:"id"`
-	NativeID string       `json:"nativeId,omitempty"`
-	Provider string       `json:"provider"`
-	Model    string       `json:"model"`
-	Name     string       `json:"name"`
-	Nickname string       `json:"nickname,omitempty"`
-	Title    string       `json:"title"`
-	Prompt   string       `json:"prompt,omitempty"`
-	Cwd      string       `json:"cwd,omitempty"`
-	Source   string       `json:"source"`
-	Started  time.Time    `json:"started"`
-	Updated  time.Time    `json:"updated"`
-	Status   model.Status `json:"status"`
-	Tokens   model.Tokens `json:"tokens"`
-	Tools    int          `json:"tools"`
+	ID       string `json:"id"`
+	NativeID string `json:"nativeId,omitempty"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Name     string `json:"name"`
+	Nickname string `json:"nickname,omitempty"`
+	Title    string `json:"title"`
+	Prompt   string `json:"prompt,omitempty"`
+	Cwd      string `json:"cwd,omitempty"`
+	Source   string `json:"source"`
+
+	// Depth, Parent and ParentLabel preserve where a run sat in the spawn tree,
+	// so history shows a nested subagent as nested and names what spawned it.
+	Depth       int    `json:"depth,omitempty"`
+	Parent      string `json:"parent,omitempty"`
+	ParentLabel string `json:"parentLabel,omitempty"`
+
+	Started time.Time    `json:"started"`
+	Updated time.Time    `json:"updated"`
+	Status  model.Status `json:"status"`
+	Tokens  model.Tokens `json:"tokens"`
+	Tools   int          `json:"tools"`
 }
 
 // Store is a JSON-backed index, flushed lazily.
@@ -76,6 +83,12 @@ func (s *Store) Upsert(a model.Agent) {
 		Nickname: a.Nickname, Title: a.Title, Prompt: a.Prompt, Cwd: a.Cwd, Source: a.Source,
 		Started: a.Started, Updated: a.Updated, Status: a.Status,
 		Tokens: a.Tokens, Tools: a.ToolCount,
+		Depth: a.Depth, Parent: a.Parent, ParentLabel: a.ParentLabel,
+	}
+	// The agent that spawned this one may be indexed after it; keep whichever
+	// name we have rather than losing it on the next update.
+	if rec.ParentLabel == "" {
+		rec.ParentLabel = prev.ParentLabel
 	}
 	// A backlog agent is indexed without being streamed, so it has no prompt to
 	// contribute; never let that erase one recorded earlier.
@@ -86,16 +99,36 @@ func (s *Store) Upsert(a model.Agent) {
 	s.dirty = true
 }
 
-// List returns every record, newest first.
+// List returns every record, newest first, with nesting resolved.
 func (s *Store) List() []Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	labels := make(map[string]string, len(s.recs))
+	for _, r := range s.recs {
+		if r.NativeID != "" {
+			labels[r.Provider+":"+r.NativeID] = label(r)
+		}
+	}
 	out := make([]Record, 0, len(s.recs))
 	for _, r := range s.recs {
+		if r.ParentLabel == "" && r.Parent != "" {
+			r.ParentLabel = labels[r.Provider+":"+r.Parent]
+		}
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Started.After(out[j].Started) })
 	return out
+}
+
+// label is the short human name for a record, matching model.Agent.Label.
+func label(r Record) string {
+	if r.Nickname != "" && r.Name != "" {
+		return r.Name + " (" + r.Nickname + ")"
+	}
+	if r.Name != "" {
+		return r.Name
+	}
+	return r.NativeID
 }
 
 // Search returns records matching every whitespace-separated term in q, newest

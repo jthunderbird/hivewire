@@ -38,6 +38,11 @@ type Provider struct {
 
 	agents  map[string]*agentTail
 	parents map[string]*parentTail
+
+	// spawns maps a Task tool_use id to the agent that issued it, which is how
+	// a nested subagent learns which agent spawned it rather than only which
+	// session it belongs to.
+	spawns map[string]string
 }
 
 // New returns a provider rooted at the given projects directory. Transcripts
@@ -49,6 +54,7 @@ func New(root string, idleDone time.Duration, since time.Time) *Provider {
 		since:    since,
 		agents:   map[string]*agentTail{},
 		parents:  map[string]*parentTail{},
+		spawns:   map[string]string{},
 	}
 }
 
@@ -65,7 +71,8 @@ type agentTail struct {
 	agent    model.Agent
 	tail     *tailer.Tailer
 	meta     metaFile
-	parent   string // parent transcript path
+	parent   string   // parent transcript path
+	spawned  []string // Task tool_use ids this agent issued
 	lastSeen time.Time
 	finished bool
 	dirty    bool // has state the hub has not seen yet
@@ -130,6 +137,15 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 		}
 		if len(lines) > 0 {
 			at.lastSeen = time.Now()
+			at.dirty = true
+		}
+		for _, useID := range at.spawned {
+			p.spawns[useID] = at.agent.NativeID
+		}
+		at.spawned = at.spawned[:0]
+		if parent := p.spawns[at.meta.ToolUseID]; parent != "" && parent != at.agent.NativeID && at.agent.Parent != parent {
+			// Spawned by another subagent, not by the session itself.
+			at.agent.Parent = parent
 			at.dirty = true
 		}
 		if st, changed := p.settle(at); changed {
@@ -413,6 +429,7 @@ type usage struct {
 
 type block struct {
 	Type      string          `json:"type"`
+	ID        string          `json:"id"`
 	Text      string          `json:"text"`
 	Thinking  string          `json:"thinking"`
 	Name      string          `json:"name"`
@@ -560,6 +577,11 @@ func (at *agentTail) parse(line []byte) []model.Event {
 			})
 		case "tool_use":
 			at.agent.ToolCount++
+			if b.Name == "Task" || b.Name == "Agent" {
+				// This agent spawned another; remembering the tool_use lets the
+				// nested agent name its spawner instead of only its session.
+				at.spawned = append(at.spawned, b.ID)
+			}
 			events = append(events, model.Event{
 				TS:     ts,
 				Kind:   model.EvToolUse,

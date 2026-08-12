@@ -82,6 +82,7 @@ func (h *Hub) Apply(u provider.Update) {
 	dropped, bytes := st.agent.Dropped, st.agent.Bytes
 	st.agent = u.Agent
 	st.agent.Dropped, st.agent.Bytes = dropped, bytes
+	h.linkParents(id)
 
 	var fresh []model.Event
 	for _, e := range u.Events {
@@ -293,6 +294,27 @@ func (h *Hub) Agent(id string) (model.Agent, bool) {
 		return model.Agent{}, false
 	}
 	return st.agent, true
+}
+
+// linkParents names the spawning agent on every agent whose parent hivewire
+// also tracks. It runs both directions because a nested agent can be discovered
+// before or after the agent that spawned it.
+func (h *Hub) linkParents(changed string) {
+	labels := make(map[string]string, len(h.agents))
+	for _, st := range h.agents {
+		if st.agent.NativeID != "" {
+			labels[st.agent.Provider+":"+st.agent.NativeID] = st.agent.Label()
+		}
+	}
+	for id, st := range h.agents {
+		if st.agent.Parent == "" {
+			continue
+		}
+		if id != changed && st.agent.ParentLabel != "" {
+			continue
+		}
+		st.agent.ParentLabel = labels[st.agent.Provider+":"+st.agent.Parent]
+	}
 }
 
 // Agents returns all agents seen this run, oldest first.

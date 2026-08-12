@@ -36,7 +36,13 @@ type Agent struct {
 	Title    string `json:"title"`    // claude: Task description; codex: derived; opencode: session title
 	Prompt   string `json:"prompt"`   // the task the agent was given, for search
 	Depth    int    `json:"depth"`
-	Parent   string `json:"parent"`
+	Parent   string `json:"parent"` // native id of the session or agent that spawned this one
+
+	// ParentLabel names the spawning agent when it is itself one hivewire
+	// tracks, which is what makes a nested subagent legible: without it, depth
+	// alone says an agent was nested but not by whom. Empty means the parent is
+	// an ordinary top-level session.
+	ParentLabel string `json:"parentLabel,omitempty"`
 
 	Cwd         string `json:"cwd"`
 	GitBranch   string `json:"gitBranch"`

@@ -167,3 +167,34 @@ func TestOpenLoadsLegacyIndexWithoutNativeID(t *testing.T) {
 		t.Fatalf("NativeID = %q, want empty", record.NativeID)
 	}
 }
+
+func TestIndexKeepsNestingAndResolvesItAcrossRecords(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The nested agent is indexed before the agent that spawned it.
+	s.Upsert(model.Agent{
+		ID: "omp:ses-helper", NativeID: "ses-helper", Provider: "omp", Name: "scout",
+		Nickname: "Helper", Depth: 2, Parent: "ses-lead", Started: time.Now(),
+	})
+	s.Upsert(model.Agent{
+		ID: "omp:ses-lead", NativeID: "ses-lead", Provider: "omp", Name: "task",
+		Nickname: "Lead", Depth: 1, Parent: "ses-session", Started: time.Now().Add(-time.Minute),
+	})
+
+	byID := map[string]Record{}
+	for _, r := range s.List() {
+		byID[r.ID] = r
+	}
+	helper := byID["omp:ses-helper"]
+	if helper.Depth != 2 || helper.Parent != "ses-lead" {
+		t.Fatalf("nesting not persisted: %+v", helper)
+	}
+	if helper.ParentLabel != "task (Lead)" {
+		t.Fatalf("parent label = %q, want the spawning agent", helper.ParentLabel)
+	}
+	if lead := byID["omp:ses-lead"]; lead.ParentLabel != "" {
+		t.Fatalf("top-level parent labelled %q", lead.ParentLabel)
+	}
+}

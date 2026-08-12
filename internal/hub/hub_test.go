@@ -222,3 +222,48 @@ func TestSubscribersGetASnapshotFirst(t *testing.T) {
 		t.Fatal("no snapshot delivered")
 	}
 }
+
+func TestApplyNamesTheSpawningAgentInBothDiscoveryOrders(t *testing.T) {
+	for _, order := range []string{"parent first", "child first"} {
+		t.Run(order, func(t *testing.T) {
+			h := New(4, 1<<20)
+			parent := provider.Update{Agent: model.Agent{
+				ID: "omp:ses-lead", NativeID: "ses-lead", Provider: "omp",
+				Name: "task", Nickname: "Lead", Status: model.StatusLive,
+			}}
+			child := provider.Update{Agent: model.Agent{
+				ID: "omp:ses-helper", NativeID: "ses-helper", Provider: "omp",
+				Name: "scout", Nickname: "Helper", Depth: 2, Parent: "ses-lead",
+				Status: model.StatusLive,
+			}}
+			if order == "parent first" {
+				h.Apply(parent)
+				h.Apply(child)
+			} else {
+				h.Apply(child)
+				h.Apply(parent)
+			}
+			for _, a := range h.Agents() {
+				if a.NativeID != "ses-helper" {
+					continue
+				}
+				if a.ParentLabel != "task (Lead)" {
+					t.Fatalf("nested agent parent label = %q, want the spawning agent", a.ParentLabel)
+				}
+				return
+			}
+			t.Fatal("nested agent missing from hub")
+		})
+	}
+}
+
+func TestApplyLeavesTopLevelAgentsUnlabelled(t *testing.T) {
+	h := New(4, 1<<20)
+	h.Apply(provider.Update{Agent: model.Agent{
+		ID: "omp:ses-child", NativeID: "ses-child", Provider: "omp", Name: "scout",
+		Depth: 1, Parent: "ses-session-not-an-agent", Status: model.StatusLive,
+	}})
+	if a := h.Agents()[0]; a.ParentLabel != "" {
+		t.Fatalf("session parent was labelled %q; only tracked agents get a name", a.ParentLabel)
+	}
+}

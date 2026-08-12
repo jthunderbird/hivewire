@@ -225,3 +225,52 @@ func TestReplayRebuildsTheStreamFromDisk(t *testing.T) {
 		t.Errorf("DurationMS = %d, want 8000 from the transcript timestamps", a.DurationMS)
 	}
 }
+
+func TestNestedSubagentNamesTheAgentThatSpawnedIt(t *testing.T) {
+	root := t.TempDir()
+	subs := filepath.Join(root, "-home-user-proj", "sess", "subagents")
+	if err := os.MkdirAll(subs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "-home-user-proj", "sess.jsonl"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The lead agent issues a Task tool_use; the nested agent's meta names that
+	// same tool_use as the thing that spawned it.
+	write := func(name, meta, body string) {
+		if err := os.WriteFile(filepath.Join(subs, name+".meta.json"), []byte(meta), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(subs, name+".jsonl"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("agent-lead", `{"agentType":"Explore","description":"lead","toolUseId":"toolu_top","spawnDepth":1}`,
+		`{"type":"assistant","timestamp":"2026-08-12T03:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_nested","name":"Task","input":{"description":"dig deeper"}}]}}`+"\n")
+	write("agent-helper", `{"agentType":"Explore","description":"helper","toolUseId":"toolu_nested","spawnDepth":2}`,
+		`{"type":"assistant","timestamp":"2026-08-12T03:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"digging"}]}}`+"\n")
+
+	p := New(root, 0, time.Now().Add(-time.Minute))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	// The spawning tool_use is read on the first poll; the link lands on the next.
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byNative := map[string]model.Agent{}
+	for _, u := range updates {
+		byNative[u.Agent.NativeID] = u.Agent
+	}
+	for _, at := range p.agents {
+		byNative[at.agent.NativeID] = at.agent
+	}
+	if helper := byNative["helper"]; helper.Parent != "lead" || helper.Depth != 2 {
+		t.Fatalf("nested agent = depth %d parent %q, want depth 2 under lead", helper.Depth, helper.Parent)
+	}
+	if lead := byNative["lead"]; lead.Parent != "sess" {
+		t.Fatalf("top-level agent parent = %q, want its session", lead.Parent)
+	}
+}
