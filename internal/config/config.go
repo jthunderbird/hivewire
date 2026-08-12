@@ -24,6 +24,7 @@ type Config struct {
 	ClaudeRoot  string `toml:"claude_root"`
 	CodexRoot   string `toml:"codex_root"`
 	OpenCodeDB  string `toml:"opencode_db"`
+	OmpRoot     string `toml:"omp_root"`
 	StateDir    string `toml:"state_dir"`
 	LogFile     string `toml:"log_file"`
 }
@@ -43,6 +44,7 @@ func Default() Config {
 		ClaudeRoot:  filepath.Join(home, ".claude", "projects"),
 		CodexRoot:   filepath.Join(home, ".codex", "sessions"),
 		OpenCodeDB:  filepath.Join(openCodeDataDir(home), "opencode.db"),
+		OmpRoot:     filepath.Join(home, ".omp", "agent", "sessions"),
 		StateDir:    filepath.Join(home, ".local", "state", "hivewire"),
 	}
 }
@@ -97,6 +99,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.ClaudeRoot, "claude-root", cfg.ClaudeRoot, "Claude Code projects directory")
 	fs.StringVar(&cfg.CodexRoot, "codex-root", cfg.CodexRoot, "Codex sessions directory")
 	fs.StringVar(&cfg.OpenCodeDB, "opencode-db", cfg.OpenCodeDB, "OpenCode SQLite database")
+	fs.StringVar(&cfg.OmpRoot, "omp-root", cfg.OmpRoot, "omp sessions directory")
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "directory for history index and layout")
 	fs.StringVar(&cfg.LogFile, "log-file", cfg.LogFile, "write logs here instead of stderr (required with --tui)")
 	fs.String("config", cfgPath, "path to config.toml")

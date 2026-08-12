@@ -1,4 +1,4 @@
-// Command hivewire streams live Claude Code, Codex and OpenCode subagent
+// Command hivewire streams live Claude Code, Codex, OpenCode and omp subagent
 // activity into a terminal UI and a LAN-reachable web page, four panes at a
 // time.
 package main
@@ -22,6 +22,7 @@ import (
 	"github.com/jtaylor/hivewire/internal/provider"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
+	"github.com/jtaylor/hivewire/internal/provider/omp"
 	"github.com/jtaylor/hivewire/internal/provider/opencode"
 	"github.com/jtaylor/hivewire/internal/store"
 	"github.com/jtaylor/hivewire/internal/tui"
@@ -152,6 +153,7 @@ func providersFor(cfg config.Config, idle time.Duration, since time.Time) []prov
 		claudecode.New(cfg.ClaudeRoot, idle, since),
 		codex.New(cfg.CodexRoot, idle, since),
 		opencode.New(cfg.OpenCodeDB, idle, since),
+		omp.New(cfg.OmpRoot, idle, since),
 	}
 }
 
@@ -159,7 +161,8 @@ func providersFor(cfg config.Config, idle time.Duration, since time.Time) []prov
 // output from. Claude Code and Codex keep those files beside their transcripts,
 // while OpenCode keeps them in a tool-output directory beside its database. Only
 // that directory is allowed, because the database's own directory also holds
-// credentials.
+// credentials. omp needs no root at all: it never truncates a tool result to a
+// file, and its data directory holds an auth database.
 func overflowRoots(cfg config.Config) []string {
 	return []string{
 		filepath.Dir(cfg.ClaudeRoot),

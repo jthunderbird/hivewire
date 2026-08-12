@@ -23,6 +23,7 @@ import (
 	"github.com/jtaylor/hivewire/internal/model"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
+	"github.com/jtaylor/hivewire/internal/provider/omp"
 	"github.com/jtaylor/hivewire/internal/provider/opencode"
 	"github.com/jtaylor/hivewire/internal/store"
 )
@@ -170,6 +171,8 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
 		a, events, err = claudecode.Replay(rec.Source)
 	case codex.Name:
 		a, events, err = codex.Replay(rec.Source)
+	case omp.Name:
+		a, events, err = omp.Replay(rec.Source)
 	case opencode.Name:
 		// OpenCode transcripts are database rows, so replay needs the session ID
 		// the index kept rather than a file path.
