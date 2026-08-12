@@ -164,9 +164,10 @@ the page on screen, and every whitespace-separated term must match. Fields
 searched: title, prompt, agent name and nickname, model, provider, cwd, status.
 Results page 50 at a time behind a **view more** button.
 
-Prompts are indexed even for transcripts that predate hivewire: discovery sniffs
-the head of each pre-existing transcript (bounded to 200 lines) purely to recover
-the prompt and model, without streaming it into a pane.
+Prompts are indexed even for runs that predate hivewire: discovery sniffs the head
+of each pre-existing transcript (bounded to 200 lines) — or, for OpenCode, reads
+each pre-existing child session once — purely to recover the prompt and model,
+without streaming any of it into a pane.
 
 **Codex caveat.** For a subagent spawned from an interactive codex session, the
 task it was handed is encrypted in the rollout — only a routing envelope naming
