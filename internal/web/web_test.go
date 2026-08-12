@@ -263,3 +263,19 @@ func TestOverflowAllowsOpenCodeToolOutputButNotItsDatabaseDirectory(t *testing.T
 		t.Fatal("auth.json beside the OpenCode database was served")
 	}
 }
+
+func TestStaticAssetsAreRevalidatedAfterAnUpgrade(t *testing.T) {
+	s, _ := newServer(t)
+	for _, path := range []string{"/", "/app.js", "/style.css"} {
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s code = %d", path, rr.Code)
+		}
+		// Embedded files carry no Last-Modified or ETag, so without this header
+		// a page loaded before a rebuild keeps serving the old UI.
+		if got := rr.Header().Get("Cache-Control"); got != "no-cache, must-revalidate" {
+			t.Errorf("%s Cache-Control = %q, want revalidation", path, got)
+		}
+	}
+}

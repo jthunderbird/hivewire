@@ -46,7 +46,7 @@ func (s *Server) Handler() http.Handler {
 		panic(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(sub)))
+	mux.Handle("/", freshAssets(http.FileServer(http.FS(sub))))
 	mux.HandleFunc("/api/stream", s.stream)
 	mux.HandleFunc("/api/agents", s.agents)
 	mux.HandleFunc("/api/agent", s.agent)
@@ -55,6 +55,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/overflow", s.overflow)
 	mux.HandleFunc("/api/focus", s.focus)
 	return cors(mux)
+}
+
+// freshAssets stops a browser reusing the UI it loaded before an upgrade.
+// Embedded files carry no modification time, so the file server sends neither
+// Last-Modified nor ETag; without a validator an open page can keep serving its
+// cached copy after hivewire is rebuilt and restarted. The assets are a few
+// kilobytes on a LAN, so revalidating every time costs nothing.
+func freshAssets(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // cors allows any origin: the UI is meant to be opened from other machines on

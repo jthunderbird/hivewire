@@ -93,7 +93,7 @@ const (
 	EvToolResult EventKind = "tool_result" // tool output
 	EvUser       EventKind = "user"        // prompt / injected message
 	EvStatus     EventKind = "status"      // lifecycle transition
-	EvNotice     EventKind = "notice"      // hivewire's own warnings (buffer wrap, parse error)
+	EvNotice     EventKind = "notice"      // out-of-band message: hivewire's own warnings (buffer wrap, parse error) or one the harness injected. Err decides whether it reads as a failure
 )
 
 // Overflow points at output the *agent harness itself* truncated before it ever

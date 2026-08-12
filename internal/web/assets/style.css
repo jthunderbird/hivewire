@@ -154,7 +154,10 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 .ev.reasoning    { border-left-color: var(--reason); color: var(--muted); }
 .ev.user         { border-left-color: var(--accent); }
 .ev.status       { border-left-color: var(--muted); color: var(--muted); }
-.ev.notice       { border-left-color: var(--error); color: var(--error); }
+.ev.notice       { border-left-color: var(--muted); color: var(--muted); }
+/* Red means an error happened, never merely that a message is a notice: a
+   harness message reporting a clean exit is informational, not a failure. */
+.ev.err          { border-left-color: var(--error); }
 .ev.err .ev-head { color: var(--error); }
 
 .ts { color: var(--muted); }
