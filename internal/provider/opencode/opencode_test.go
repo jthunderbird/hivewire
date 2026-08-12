@@ -1015,6 +1015,9 @@ func TestPollStreamsMutablePhasesAndLifecycleOnce(t *testing.T) {
 	if statusEvent.TS.UnixMilli() != completed || second[0].Agent.Status != model.StatusDone || second[0].Agent.EventCount != 6 {
 		t.Fatalf("completion status/count = %+v, event=%+v", second[0].Agent, statusEvent)
 	}
+	if second[0].Agent.ToolCount != 1 {
+		t.Fatalf("tool result transition double-counted tool: %+v", second[0].Agent)
+	}
 	if second[0].Agent.Updated.UnixMilli() != base+40 || second[0].Agent.DurationMS != 40 {
 		t.Fatalf("deterministic updated/duration = %v/%d", second[0].Agent.Updated, second[0].Agent.DurationMS)
 	}
@@ -1544,6 +1547,8 @@ func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T)
 	insertSession(t, db, "child", "parent", base)
 	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
 	p := New(path, 40*time.Millisecond, time.UnixMilli(base-1))
+	now := time.UnixMilli(base + 1)
+	p.now = func() time.Time { return now }
 	if _, err := p.Poll(); err != nil {
 		t.Fatal(err)
 	}
@@ -1566,7 +1571,7 @@ func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T)
 		t.Fatalf("session metadata Updated = %v, want %v", metadata[0].Agent.Updated, metadataTime)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	now = metadataTime.Add(50 * time.Millisecond)
 	idle, err := p.Poll()
 	if err != nil {
 		t.Fatal(err)
@@ -1576,6 +1581,96 @@ func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T)
 	}
 	if len(idle) != 1 || idle[0].Agent.Status != model.StatusDone || !reflect.DeepEqual(normalizedKinds(idle[0].Events), []model.EventKind{model.EvStatus}) {
 		t.Fatalf("idle transition = %+v", idle)
+	}
+}
+
+func TestIncrementalStateAndSQLStayBoundedAfterLargeLiveHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Add(-time.Minute).UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3000; i++ {
+		id := fmt.Sprintf("message-%04d", i)
+		created := base + int64(i)
+		if _, err := tx.Exec(`INSERT INTO message VALUES (?,?,?,?,?)`, id, "child", created, created, `{"role":"assistant","time":{"completed":1},"finish":"stop"}`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO part VALUES (?,?,?,?,?,?)`, "part-"+id, id, "child", created, created, `{"type":"text","text":"completed historical body","time":{"end":1}}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(path, 0, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	at := p.agents[Name+":child"]
+	if len(at.state) != 6000 {
+		t.Fatalf("compact emitted IDs = %d, want 6000 message/part phases", len(at.state))
+	}
+	for id, state := range at.state {
+		if state.fingerprint != "" {
+			t.Fatalf("completed state %s retained fingerprint", id)
+		}
+	}
+	if len(at.message.frontier) > 1 || len(at.part.frontier) > 1 {
+		t.Fatalf("frontiers grew with history: messages=%d parts=%d", len(at.message.frontier), len(at.part.frontier))
+	}
+	if p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("initial query args = %d, want at most session+watermark", p.db.lastPoll.maxQueryArgs)
+	}
+
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("idle poll = %+v, %v", updates, err)
+	}
+	if p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("idle query args = %d, grew with history", p.db.lastPoll.maxQueryArgs)
+	}
+	if p.lastNormalized.messageRows != 0 || p.lastNormalized.partRows != 0 {
+		t.Fatalf("idle normalized rows = %+v", p.lastNormalized)
+	}
+
+	lastPart := "part-message-2999"
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id=?`, `{"type":"text","text":"changed","time":{"end":2}}`, lastPart); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 || p.lastNormalized.messageRows != 0 || p.lastNormalized.partRows != 1 {
+		t.Fatalf("one-row delta = %+v, normalized=%+v", updates, p.lastNormalized)
+	}
+	if p.db.lastPoll.maxQueryArgs > 2 {
+		t.Fatalf("post-delta query args=%d", p.db.lastPoll.maxQueryArgs)
+	}
+	if len(at.state) != 6000 {
+		t.Fatalf("delta replaced compact emitted IDs: %d", len(at.state))
+	}
+}
+
+func TestMetadataOnlyPollPropagatesParentCycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "parent", "root", base)
+	insertSession(t, db, "child", "parent", base)
+	p := New(path, 0, time.UnixMilli(base+2))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE session SET parent_id='child' WHERE id='parent'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Poll(); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("metadata-only cycle error = %v", err)
 	}
 }
 

@@ -43,14 +43,14 @@ type database struct {
 }
 
 type pollStats struct {
-	messageRows int
-	partRows    int
+	messageRows  int
+	partRows     int
+	maxQueryArgs int
 }
 
 type rowCursor struct {
 	updated  int64
-	boundary map[string]string
-	watched  map[string]string
+	frontier map[string]string
 }
 
 type pollRequest struct {
@@ -58,6 +58,13 @@ type pollRequest struct {
 	updatedSince int64
 	messages     rowCursor
 	parts        rowCursor
+	messageWatch rowWatch
+	partWatches  map[string]string
+}
+
+type rowWatch struct {
+	id          string
+	fingerprint string
 }
 
 func newDatabase(path string) *database {
@@ -145,6 +152,13 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		if req.skip {
 			continue
 		}
+		args := 1
+		if req.updatedSince > 0 || req.messages.updated > 0 || req.parts.updated > 0 {
+			args = 2
+		}
+		if args > d.lastPoll.maxQueryArgs {
+			d.lastPoll.maxQueryArgs = args
+		}
 		result.messages[session.id], err = queryMessagesIncremental(ctx, tx, session.id, req.updatedSince, req.messages)
 		if err != nil {
 			return dbSnapshot{}, err
@@ -153,6 +167,27 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		if err != nil {
 			return dbSnapshot{}, err
 		}
+		if req.messageWatch.id != "" && !hasMessage(result.messages[session.id], req.messageWatch.id) {
+			row, ok, err := queryMessageWatch(ctx, tx, session.id, req.messageWatch)
+			if err != nil {
+				return dbSnapshot{}, err
+			}
+			if ok {
+				result.messages[session.id] = append(result.messages[session.id], row)
+			}
+		}
+		for id, fingerprint := range req.partWatches {
+			if hasPart(result.parts[session.id], id) {
+				continue
+			}
+			row, ok, err := queryPartWatch(ctx, tx, session.id, rowWatch{id: id, fingerprint: fingerprint})
+			if err != nil {
+				return dbSnapshot{}, err
+			}
+			if ok {
+				result.parts[session.id] = append(result.parts[session.id], row)
+			}
+		}
 		d.lastPoll.messageRows += len(result.messages[session.id])
 		d.lastPoll.partRows += len(result.parts[session.id])
 	}
@@ -160,6 +195,44 @@ func (d *database) pollSnapshot(ctx context.Context, request func(sessionRow) po
 		return dbSnapshot{}, err
 	}
 	return result, nil
+}
+
+func queryMessageWatch(ctx context.Context, tx *sql.Tx, sessionID string, watch rowWatch) (messageRow, bool, error) {
+	var row messageRow
+	err := tx.QueryRowContext(ctx, `SELECT id,session_id,time_created,time_updated,data FROM message WHERE session_id = ? AND id = ?`, sessionID, watch.id).
+		Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messageRow{}, false, nil
+	}
+	return row, err == nil && rowFingerprint(row.data) != watch.fingerprint, err
+}
+
+func queryPartWatch(ctx context.Context, tx *sql.Tx, sessionID string, watch rowWatch) (partRow, bool, error) {
+	var row partRow
+	err := tx.QueryRowContext(ctx, `SELECT id,message_id,session_id,time_created,time_updated,data FROM part WHERE session_id = ? AND id = ?`, sessionID, watch.id).
+		Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return partRow{}, false, nil
+	}
+	return row, err == nil && rowFingerprint(row.data) != watch.fingerprint, err
+}
+
+func hasMessage(rows []messageRow, id string) bool {
+	for _, row := range rows {
+		if row.id == id {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPart(rows []partRow, id string) bool {
+	for _, row := range rows {
+		if row.id == id {
+			return true
+		}
+	}
+	return false
 }
 
 func openDatabase(ctx context.Context, path string) (*sql.DB, bool, error) {
@@ -283,18 +356,11 @@ func queryMessagesIncremental(ctx context.Context, tx *sql.Tx, sessionID string,
 		query += ` AND time_updated >= ?`
 		args = append(args, updatedSince)
 	} else if cursor.updated > 0 {
-		query += ` AND (time_updated > ? OR (time_updated = ?`
-		args = append(args, cursor.updated, cursor.updated)
-		for id, data := range cursor.boundary {
-			query += ` AND NOT (id = ? AND data = ?)`
-			args = append(args, id, data)
-		}
-		query += `)`
-		for id, data := range cursor.watched {
-			query += ` OR (id = ? AND data <> ?)`
-			args = append(args, id, data)
-		}
-		query += `)`
+		query += ` AND time_updated >= ?`
+		args = append(args, cursor.updated)
+	}
+	if len(args) > 2 {
+		panic("incremental message query has unbounded arguments")
 	}
 	query += ` ORDER BY time_created,id`
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -308,6 +374,9 @@ func queryMessagesIncremental(ctx context.Context, tx *sql.Tx, sessionID string,
 		if err := rows.Scan(&row.id, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data); err != nil {
 			return nil, err
 		}
+		if row.timeUpdated == cursor.updated && cursor.frontier[row.id] == rowFingerprint(row.data) {
+			continue
+		}
 		result = append(result, row)
 	}
 	return result, rows.Err()
@@ -320,18 +389,11 @@ func queryPartsIncremental(ctx context.Context, tx *sql.Tx, sessionID string, up
 		query += ` AND time_updated >= ?`
 		args = append(args, updatedSince)
 	} else if cursor.updated > 0 {
-		query += ` AND (time_updated > ? OR (time_updated = ?`
-		args = append(args, cursor.updated, cursor.updated)
-		for id, data := range cursor.boundary {
-			query += ` AND NOT (id = ? AND data = ?)`
-			args = append(args, id, data)
-		}
-		query += `)`
-		for id, data := range cursor.watched {
-			query += ` OR (id = ? AND data <> ?)`
-			args = append(args, id, data)
-		}
-		query += `)`
+		query += ` AND time_updated >= ?`
+		args = append(args, cursor.updated)
+	}
+	if len(args) > 2 {
+		panic("incremental part query has unbounded arguments")
 	}
 	query += ` ORDER BY time_created,id`
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -344,6 +406,9 @@ func queryPartsIncremental(ctx context.Context, tx *sql.Tx, sessionID string, up
 		var row partRow
 		if err := rows.Scan(&row.id, &row.messageID, &row.sessionID, &row.timeCreated, &row.timeUpdated, &row.data); err != nil {
 			return nil, err
+		}
+		if row.timeUpdated == cursor.updated && cursor.frontier[row.id] == rowFingerprint(row.data) {
+			continue
 		}
 		result = append(result, row)
 	}
