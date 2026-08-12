@@ -66,6 +66,10 @@ type partData struct {
 	} `json:"state"`
 }
 
+type partHeader struct {
+	Type string `json:"type"`
+}
+
 type eventGroup struct {
 	effective int64
 	created   int64
@@ -109,9 +113,16 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 	var groups []eventGroup
 	var newest *messageRow
 	var newestData messageData
+	var newestMalformed bool
 	for i := range messages {
 		row := messages[i]
 		result.agent.Updated = laterTime(result.agent.Updated, unixMillis(row.timeUpdated))
+		authoritative := newest == nil || row.timeCreated > newest.timeCreated || row.timeCreated == newest.timeCreated && row.id > newest.id
+		if authoritative {
+			newest = &messages[i]
+			newestData = messageData{}
+			newestMalformed = false
+		}
 		fingerprint := rowFingerprint(row.data)
 		state := prior[row.id]
 		if state.fingerprint != fingerprint {
@@ -121,6 +132,9 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 
 		var data messageData
 		if err := json.Unmarshal([]byte(row.data), &data); err != nil {
+			if authoritative {
+				newestMalformed = true
+			}
 			notice := malformedNotice(result.agent.ID, "message", row.id, err, row.timeUpdated, row.timeCreated)
 			if state.malformed != fingerprint {
 				groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
@@ -140,8 +154,7 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 				result.agent.Model = data.Model.ModelID
 			}
 		}
-		if newest == nil || row.timeCreated > newest.timeCreated || row.timeCreated == newest.timeCreated && row.id > newest.id {
-			newest = &messages[i]
+		if authoritative {
 			newestData = data
 		}
 		if len(data.Error) > 0 && string(data.Error) != "null" {
@@ -176,14 +189,25 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 		result.agent.Updated = laterTime(result.agent.Updated, unixMillis(row.timeUpdated))
 		fingerprint := rowFingerprint(row.data)
 		state := prior[row.id]
-		changed := state.fingerprint != fingerprint
-		if changed {
-			state.user = false
-			state.textDone = false
-			state.reasoningDone = false
+		if state.fingerprint != fingerprint {
 			state.malformed = ""
 		}
 		state.fingerprint = fingerprint
+
+		var header partHeader
+		if err := json.Unmarshal([]byte(row.data), &header); err != nil {
+			notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
+			if state.malformed != fingerprint {
+				groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
+				state.malformed = fingerprint
+			}
+			result.state[row.id] = state
+			continue
+		}
+		if header.Type != "text" && header.Type != "reasoning" && header.Type != "tool" {
+			result.state[row.id] = state
+			continue
+		}
 
 		var data partData
 		if err := json.Unmarshal([]byte(row.data), &data); err != nil {
@@ -278,7 +302,12 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 	}
 
 	if newest != nil {
-		result.status, result.statusTime = messageStatus(*newest, newestData)
+		if newestMalformed {
+			result.status = model.StatusLive
+			result.statusTime = unixMillis(firstPositive(newest.timeUpdated, newest.timeCreated))
+		} else {
+			result.status, result.statusTime = messageStatus(*newest, newestData)
+		}
 		result.agent.Status = result.status
 	}
 	for _, state := range result.state {

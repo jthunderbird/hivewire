@@ -672,6 +672,94 @@ func TestNormalizeIncompleteMutationAndRepeatedState(t *testing.T) {
 	}
 }
 
+func TestNormalizeFingerprintChangesPreserveEmittedPhases(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "u", timeCreated: 2, data: `{"role":"user"}`},
+		{id: "a", timeCreated: 3, data: `{"role":"assistant"}`},
+	}
+	parts := []partRow{
+		{id: "user", messageID: "u", timeCreated: 10, data: `{"type":"text","text":"prompt"}`},
+		{id: "text", messageID: "a", timeCreated: 20, data: `{"type":"text","text":"answer","time":{"end":21}}`},
+		{id: "reason", messageID: "a", timeCreated: 30, data: `{"type":"reasoning","text":"thought","time":{"end":31}}`},
+		{id: "tool", messageID: "a", timeCreated: 40, data: `{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"a"},"output":"old"}}`},
+	}
+	first, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kinds := normalizedKinds(first.events); !reflect.DeepEqual(kinds, []model.EventKind{
+		model.EvUser, model.EvText, model.EvReasoning, model.EvToolUse, model.EvToolResult,
+	}) {
+		t.Fatalf("initial kinds = %v", kinds)
+	}
+
+	parts[0].data = `{"type":"text","text":"changed prompt"}`
+	parts[1].data = `{"type":"text","text":"changed answer","time":{"end":21}}`
+	parts[2].data = `{"type":"reasoning","text":"changed thought","time":{"end":31}}`
+	parts[3].data = `{"type":"tool","tool":"read","state":{"status":"completed","input":{"file_path":"b"},"output":"new"}}`
+	changed, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", first.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed.events) != 0 {
+		t.Fatalf("fingerprint-only changes repeated emitted phases: %+v", changed.events)
+	}
+	if state := changed.state["user"]; !state.user {
+		t.Fatalf("user phase was cleared: %+v", state)
+	}
+	if state := changed.state["text"]; !state.textDone {
+		t.Fatalf("text phase was cleared: %+v", state)
+	}
+	if state := changed.state["reason"]; !state.reasoningDone {
+		t.Fatalf("reasoning phase was cleared: %+v", state)
+	}
+	if state := changed.state["tool"]; !state.toolUse || !state.toolResult {
+		t.Fatalf("tool phases were cleared: %+v", state)
+	}
+}
+
+func TestNormalizeUnsupportedPartIgnoresConflictingSupportedFields(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	message := messageRow{id: "a", timeCreated: 2, data: `{"role":"assistant"}`}
+	part := partRow{
+		id: "unsupported", messageID: "a", timeCreated: 3,
+		data: `{"type":"snapshot","text":42,"synthetic":"wrong","state":{"input":"wrong","output":false}}`,
+	}
+	got, err := normalizeSession(session, []sessionRow{session}, []messageRow{message}, []partRow{part}, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.events) != 0 || got.state[part.id].malformed != "" {
+		t.Fatalf("unsupported valid part was decoded as supported: events=%+v state=%+v", got.events, got.state[part.id])
+	}
+}
+
+func TestNormalizeMalformedNewestMessageOverridesOlderTerminal(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "a-done", timeCreated: 100, timeUpdated: 110, data: `{"role":"assistant","time":{"completed":110},"finish":"stop"}`},
+		{id: "z-malformed", timeCreated: 100, timeUpdated: 120, data: `{"role":`},
+	}
+	first, err := normalizeSession(session, []sessionRow{session}, messages, nil, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.status != model.StatusLive || !first.statusTime.Equal(time.UnixMilli(120)) {
+		t.Fatalf("malformed newest authority = %q at %v, want live at 120ms", first.status, first.statusTime)
+	}
+	if len(first.events) != 1 || first.events[0].Kind != model.EvNotice || !first.events[0].Err {
+		t.Fatalf("malformed newest notice = %+v", first.events)
+	}
+	second, err := normalizeSession(session, []sessionRow{session}, messages, nil, "db", first.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.events) != 0 || second.status != model.StatusLive {
+		t.Fatalf("malformed newest repeated result = %+v", second)
+	}
+}
+
 func TestNormalizeAssistantErrorPrecedenceAndMalformedDedup(t *testing.T) {
 	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
 	messages := []messageRow{
