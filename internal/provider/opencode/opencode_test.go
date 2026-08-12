@@ -3,13 +3,16 @@ package opencode
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jtaylor/hivewire/internal/model"
 	_ "modernc.org/sqlite"
 )
 
@@ -503,6 +506,249 @@ func partIDs(rows []partRow) string {
 			result += ","
 		}
 		result += row.id
+	}
+	return result
+}
+
+func TestNormalizeRepresentativeOpenCodeRows(t *testing.T) {
+	sessions := []sessionRow{
+		{id: "ses_parent", parentID: "ses_root"},
+		{
+			id: "ses_child", parentID: "ses_parent", directory: "/work/tree",
+			title: "Audit parser (@general subagent)", version: "1.15.7", agent: "general",
+			model: "gpt-5.6-sol", timeCreated: 900, timeUpdated: 1700,
+			tokensInput: 100, tokensOutput: 20, tokensReasoning: 5,
+			tokensCacheRead: 50, tokensCacheWrite: 2,
+		},
+	}
+	messages := []messageRow{
+		{id: "msg_user", sessionID: "ses_child", timeCreated: 1000, timeUpdated: 1001, data: `{"role":"user","time":{"created":1000},"agent":"general","model":{"providerID":"openai","modelID":"gpt-5.6-sol"},"future":true}`},
+		{id: "msg_assistant", sessionID: "ses_child", timeCreated: 1100, timeUpdated: 1900, data: `{"role":"assistant","time":{"created":1100,"completed":1900},"parentID":"msg_user","providerID":"openai","modelID":"gpt-5.6-sol","agent":"general","finish":"stop","tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":50,"write":0}},"unknown":{"x":1}}`},
+	}
+	parts := []partRow{
+		{id: "part_user", messageID: "msg_user", sessionID: "ses_child", timeCreated: 1000, timeUpdated: 1001, data: `{"type":"text","text":"audit the parser","time":{"start":1000,"end":1001}}`},
+		{id: "part_synthetic", messageID: "msg_user", sessionID: "ses_child", timeCreated: 1002, timeUpdated: 1003, data: `{"type":"text","text":"hidden context","synthetic":true,"time":{"start":1002,"end":1003}}`},
+		{id: "part_reasoning", messageID: "msg_assistant", sessionID: "ses_child", timeCreated: 1200, timeUpdated: 1250, data: `{"type":"reasoning","text":"inspect rows","time":{"start":1200,"end":1250}}`},
+		{id: "part_tool", messageID: "msg_assistant", sessionID: "ses_child", timeCreated: 1300, timeUpdated: 1500, data: `{"type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok\nFull output saved to: /data/tool-output/call_1","title":"Run tests","metadata":{},"time":{"start":1300,"end":1500}}}`},
+		{id: "part_unknown", messageID: "msg_assistant", sessionID: "ses_child", timeCreated: 1400, timeUpdated: 1400, data: `{"type":"snapshot","future":"field"}`},
+		{id: "part_text", messageID: "msg_assistant", sessionID: "ses_child", timeCreated: 1600, timeUpdated: 1800, data: `{"type":"text","text":"All checks pass.","time":{"start":1600,"end":1800}}`},
+	}
+
+	got, err := normalizeSession(sessions[1], sessions, messages, parts, "/data/opencode.db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := got.agent
+	if a.ID != "opencode:ses_child" || a.NativeID != "ses_child" || a.Provider != "opencode" {
+		t.Fatalf("agent IDs = %q/%q/%q", a.ID, a.NativeID, a.Provider)
+	}
+	if a.Name != "general" || a.Title != "Audit parser" || a.Parent != "ses_parent" || a.Depth != 2 {
+		t.Fatalf("agent identity mapping = %+v", a)
+	}
+	if a.Cwd != "/work/tree" || a.CLIVersion != "1.15.7" || a.Model != "gpt-5.6-sol" || a.Source != "/data/opencode.db" {
+		t.Fatalf("agent source mapping = %+v", a)
+	}
+	if a.Prompt != "audit the parser" || a.ToolCount != 1 {
+		t.Fatalf("prompt/tool count = %q/%d", a.Prompt, a.ToolCount)
+	}
+	wantTokens := model.Tokens{In: 100, Out: 20, Reasoning: 5, CacheRead: 50, CacheWrite: 2, Total: 120}
+	if a.Tokens != wantTokens {
+		t.Fatalf("tokens = %+v, want %+v", a.Tokens, wantTokens)
+	}
+	if !a.Started.Equal(time.UnixMilli(900)) || !a.Updated.Equal(time.UnixMilli(1900)) {
+		t.Fatalf("agent times = %v/%v", a.Started, a.Updated)
+	}
+	wantKinds := []model.EventKind{model.EvUser, model.EvReasoning, model.EvToolUse, model.EvToolResult, model.EvText}
+	if gotKinds := normalizedKinds(got.events); !reflect.DeepEqual(gotKinds, wantKinds) {
+		t.Fatalf("event kinds = %v, want %v", gotKinds, wantKinds)
+	}
+	for _, event := range got.events {
+		if event.AgentID != a.ID || event.Header == "" {
+			t.Fatalf("incomplete event: %+v", event)
+		}
+	}
+	toolUse, toolResult := got.events[2], got.events[3]
+	if toolUse.Tool != "bash" || !strings.Contains(toolUse.Header, "bash") || !strings.Contains(toolUse.Body, "go test ./...") {
+		t.Fatalf("tool use = %+v", toolUse)
+	}
+	if toolResult.Err || toolResult.Lines != 2 || toolResult.Overflow == nil || toolResult.Overflow.Path != "/data/tool-output/call_1" {
+		t.Fatalf("tool result = %+v", toolResult)
+	}
+	if got.status != model.StatusDone || !got.statusTime.Equal(time.UnixMilli(1900)) {
+		t.Fatalf("authoritative status = %q at %v", got.status, got.statusTime)
+	}
+}
+
+func TestNormalizeAgentFallbackTitleAndDepthErrors(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "missing", title: "Task (@general subagent) extra", model: "exact-model", timeCreated: 1}
+	messages := []messageRow{{id: "m", timeCreated: 2, data: `{"role":"assistant","agent":"general","modelID":"fallback-model"}`}}
+	got, err := normalizeSession(session, []sessionRow{session}, messages, nil, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.agent.Name != "general" || got.agent.Title != session.title || got.agent.Depth != 1 || got.agent.Model != "exact-model" {
+		t.Fatalf("fallback/exact mapping = %+v", got.agent)
+	}
+
+	cycle := []sessionRow{{id: "a", parentID: "b"}, {id: "b", parentID: "a"}}
+	if _, err := normalizeSession(cycle[0], cycle, nil, nil, "db", nil); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cycle error = %v", err)
+	}
+}
+
+func TestNormalizeOrderingFallbacksAndAtomicTerminalTool(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "u", timeCreated: 2, data: `{"role":"user"}`},
+		{id: "a", timeCreated: 3, data: `{"role":"assistant"}`},
+	}
+	parts := []partRow{
+		{id: "z-user", messageID: "u", timeCreated: 100, timeUpdated: 101, data: `{"type":"text","text":"user"}`},
+		{id: "b-reasoning", messageID: "a", timeCreated: 200, timeUpdated: 201, data: `{"type":"reasoning","text":"reason","time":{"end":201}}`},
+		{id: "a-text", messageID: "a", timeCreated: 200, timeUpdated: 201, data: `{"type":"text","text":"text","time":{"end":201}}`},
+		{id: "tool", messageID: "a", timeCreated: 300, timeUpdated: 500, data: `{"type":"tool","tool":"bash","state":{"status":"completed","input":{},"output":"done"}}`},
+		{id: "between", messageID: "a", timeCreated: 400, timeUpdated: 401, data: `{"type":"text","text":"between","time":{"start":400,"end":401}}`},
+	}
+	got, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBodies := []string{"user", "text", "reason", "{}", "done", "between"}
+	if bodies := normalizedBodies(got.events); !reflect.DeepEqual(bodies, wantBodies) {
+		t.Fatalf("ordered bodies = %#v, want %#v", bodies, wantBodies)
+	}
+	wantTimes := []int64{100, 200, 200, 300, 500, 400}
+	for i, want := range wantTimes {
+		if got.events[i].TS.UnixMilli() != want {
+			t.Fatalf("event %d time = %d, want %d", i, got.events[i].TS.UnixMilli(), want)
+		}
+	}
+}
+
+func TestNormalizeIncompleteMutationAndRepeatedState(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "u", timeCreated: 2, data: `{"role":"user"}`},
+		{id: "a", timeCreated: 3, data: `{"role":"assistant"}`},
+	}
+	parts := []partRow{
+		{id: "user", messageID: "u", timeCreated: 10, timeUpdated: 10, data: `{"type":"text","text":"prompt"}`},
+		{id: "text", messageID: "a", timeCreated: 20, timeUpdated: 20, data: `{"type":"text","text":"draft","time":{"start":20}}`},
+		{id: "reason", messageID: "a", timeCreated: 30, timeUpdated: 30, data: `{"type":"reasoning","text":"draft","time":{"start":30}}`},
+		{id: "tool", messageID: "a", timeCreated: 40, timeUpdated: 40, data: `{"type":"tool","tool":"read","state":{"status":"running","input":{"file_path":"a"},"time":{"start":40}}}`},
+	}
+	first, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kinds := normalizedKinds(first.events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvUser, model.EvToolUse}) {
+		t.Fatalf("initial kinds = %v", kinds)
+	}
+	if first.agent.ToolCount != 1 || first.state["text"].textDone || first.state["reason"].reasoningDone {
+		t.Fatalf("initial state = %+v, agent = %+v", first.state, first.agent)
+	}
+
+	repeated, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", first.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repeated.events) != 0 || repeated.agent.ToolCount != 1 {
+		t.Fatalf("repeated normalization emitted %+v", repeated)
+	}
+
+	parts[1].data = `{"type":"text","text":"final","time":{"start":20,"end":25}}`
+	parts[2].data = `{"type":"reasoning","text":"final reason","time":{"start":30,"end":35}}`
+	parts[3].data = `{"type":"tool","tool":"read","state":{"status":"error","input":{"file_path":"a"},"error":"permission denied","time":{"start":40,"end":45}}}`
+	completed, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", repeated.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKinds := []model.EventKind{model.EvText, model.EvReasoning, model.EvToolResult}
+	if kinds := normalizedKinds(completed.events); !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("completion kinds = %v", kinds)
+	}
+	if !completed.events[2].Err || completed.events[2].Body != "permission denied" || completed.agent.ToolCount != 1 {
+		t.Fatalf("errored tool transition = %+v, count %d", completed.events[2], completed.agent.ToolCount)
+	}
+}
+
+func TestNormalizeAssistantErrorPrecedenceAndMalformedDedup(t *testing.T) {
+	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+	messages := []messageRow{
+		{id: "bad-message", timeCreated: 10, timeUpdated: 11, data: `{"role":`},
+		{id: "error", timeCreated: 20, timeUpdated: 21, data: `{"role":"assistant","time":{"completed":25},"finish":"error","error":{"name":"FallbackName","message":"fallback message","data":{"message":"preferred detail"},"code":500}}`},
+	}
+	parts := []partRow{
+		{id: "bad-part", messageID: "error", timeCreated: 30, timeUpdated: 31, data: `{"type":"text","text":42}`},
+		{id: "unknown", messageID: "error", timeCreated: 32, timeUpdated: 32, data: `{"type":"future","value":42}`},
+	}
+	first, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.events) != 3 {
+		t.Fatalf("events = %+v", first.events)
+	}
+	if first.events[0].Kind != model.EvNotice || !first.events[0].Err || !strings.Contains(first.events[0].Body, "malformed") {
+		t.Fatalf("malformed message notice = %+v", first.events[0])
+	}
+	if first.events[1].Body != "preferred detail" || !first.events[1].Err {
+		t.Fatalf("assistant error notice = %+v", first.events[1])
+	}
+	if first.events[2].Kind != model.EvNotice || !strings.Contains(first.events[2].Body, "malformed") {
+		t.Fatalf("malformed part notice = %+v", first.events[2])
+	}
+	if first.status != model.StatusError || first.statusTime.UnixMilli() != 25 {
+		t.Fatalf("error status = %q at %v", first.status, first.statusTime)
+	}
+
+	second, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", first.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.events) != 0 {
+		t.Fatalf("malformed/error notices repeated: %+v", second.events)
+	}
+	parts[0].data = `{"type":"text","text":false}`
+	changed, err := normalizeSession(session, []sessionRow{session}, messages, parts, "db", second.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed.events) != 1 || changed.events[0].Kind != model.EvNotice {
+		t.Fatalf("changed malformed row was not detected: %+v", changed.events)
+	}
+}
+
+func TestNormalizeAssistantErrorMappingPrecedence(t *testing.T) {
+	tests := []struct {
+		name, raw, want string
+	}{
+		{"data message", `{"data":{"message":"data"},"message":"message","name":"name"}`, "data"},
+		{"message", `{"message":"message","name":"name"}`, "message"},
+		{"name", `{"name":"name","code":500}`, "name"},
+		{"formatted JSON", `{"code":500}`, "{\n  \"code\": 500\n}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := assistantError(json.RawMessage(tt.raw)); got != tt.want {
+				t.Fatalf("assistantError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func normalizedKinds(events []model.Event) []model.EventKind {
+	result := make([]model.EventKind, len(events))
+	for i := range events {
+		result[i] = events[i].Kind
+	}
+	return result
+}
+
+func normalizedBodies(events []model.Event) []string {
+	result := make([]string, len(events))
+	for i := range events {
+		result[i] = events[i].Body
 	}
 	return result
 }
