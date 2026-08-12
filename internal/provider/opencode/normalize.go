@@ -89,11 +89,11 @@ type eventGroup struct {
 }
 
 func normalizeSession(session sessionRow, sessions []sessionRow, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart) (normalizedSession, error) {
-	return normalizeSessionMode(session, sessions, messages, parts, source, prior, true, nil)
+	return normalizeSessionMode(session, parentIndex(sessions), messages, parts, source, prior, true, nil)
 }
 
-func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart, emitEvents bool, stats *normalizationStats) (normalizedSession, error) {
-	depth, err := sessionDepth(session, sessions)
+func normalizeSessionMode(session sessionRow, parents map[string]string, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart, emitEvents bool, stats *normalizationStats) (normalizedSession, error) {
+	depth, err := sessionDepth(session, parents)
 	if err != nil {
 		return normalizedSession{}, err
 	}
@@ -108,7 +108,7 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 		Depth:      depth,
 		Parent:     session.parentID,
 		Cwd:        session.directory,
-		Model:      session.model,
+		Model:      sessionModelID(session.model),
 		CLIVersion: session.version,
 		Source:     source,
 		Started:    unixMillis(session.timeCreated),
@@ -388,11 +388,40 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 	return result, nil
 }
 
-func sessionDepth(session sessionRow, sessions []sessionRow) (int, error) {
+// sessionModelID reads the model column, which OpenCode writes as a JSON object
+// like {"id":"gpt-5.6-sol","providerID":"openai"} in current versions and as a
+// bare model ID in older ones.
+func sessionModelID(raw string) string {
+	if !strings.HasPrefix(raw, "{") {
+		return raw
+	}
+	var decoded struct {
+		ID      string `json:"id"`
+		ModelID string `json:"modelID"`
+	}
+	if json.Unmarshal([]byte(raw), &decoded) != nil {
+		return raw
+	}
+	if decoded.ID != "" {
+		return decoded.ID
+	}
+	if decoded.ModelID != "" {
+		return decoded.ModelID
+	}
+	return raw
+}
+
+// parentIndex maps every session ID to its parent, so depth is walked without
+// rescanning the session list once per session.
+func parentIndex(sessions []sessionRow) map[string]string {
 	parents := make(map[string]string, len(sessions))
 	for _, row := range sessions {
 		parents[row.id] = row.parentID
 	}
+	return parents
+}
+
+func sessionDepth(session sessionRow, parents map[string]string) (int, error) {
 	depth := 0
 	seen := map[string]bool{session.id: true}
 	parent := session.parentID

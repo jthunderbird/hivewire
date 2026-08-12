@@ -112,8 +112,9 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 	}
 
 	var updates []provider.Update
+	parents := parentIndex(snapshot.sessions)
 	for _, session := range snapshot.sessions {
-		update, err := p.applySession(session, snapshot)
+		update, err := p.applySession(session, snapshot, parents)
 		if err != nil {
 			return nil, err
 		}
@@ -126,11 +127,18 @@ func (p *Provider) Poll() ([]provider.Update, error) {
 
 // applySession folds one session's changed rows into its agent, returning an
 // update when anything the hub can see moved.
-func (p *Provider) applySession(session sessionRow, snapshot dbSnapshot) (*provider.Update, error) {
+func (p *Provider) applySession(session sessionRow, snapshot dbSnapshot, parents map[string]string) (*provider.Update, error) {
 	id := Name + ":" + session.id
 	at, exists := p.agents[id]
 	changedMessages := snapshot.messages[session.id]
 	changedParts := snapshot.parts[session.id]
+
+	if exists && len(changedMessages) == 0 && len(changedParts) == 0 {
+		// Nothing new to parse: refresh what the session row owns and let the
+		// idle fallback run. This is the common case once a database fills up
+		// with finished sessions, so it stays free of normalization work.
+		return p.applySessionMetadata(at, session, parents)
+	}
 
 	messages, parts := changedMessages, changedParts
 	var prior map[string]emittedPart
@@ -158,7 +166,7 @@ func (p *Provider) applySession(session sessionRow, snapshot dbSnapshot) (*provi
 		backlog = at.agent.Backlog && len(messages) == 0 && len(parts) == 0
 	}
 
-	normalized, err := normalizeSessionMode(session, snapshot.sessions, messages, parts, p.db.path, prior, !backlog, nil)
+	normalized, err := normalizeSessionMode(session, parents, messages, parts, p.db.path, prior, !backlog, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +232,63 @@ func (p *Provider) applySession(session sessionRow, snapshot dbSnapshot) (*provi
 		return nil, nil
 	}
 	return &provider.Update{Agent: at.agent, Events: events}, nil
+}
+
+// applySessionMetadata handles a poll that read no rows for this session.
+func (p *Provider) applySessionMetadata(at *agentTail, session sessionRow, parents map[string]string) (*provider.Update, error) {
+	depth, err := sessionDepth(session, parents)
+	if err != nil {
+		return nil, err
+	}
+	agent := refreshFromSession(at.agent, session, depth, p.db.path)
+	var events []model.Event
+	if !agent.Backlog {
+		activity := sessionActivity(session, nil, nil)
+		activity = laterTime(activity, agent.Updated)
+		if status, statusTime := p.settle(agent.Status, agent.Updated, activity); status != agent.Status {
+			agent.Status = status
+			events = append(events, statusEvent(agent.ID, status, statusTime))
+			agent.EventCount++
+		}
+	}
+	agent.DurationMS = agentDuration(agent)
+
+	changed := agent != at.agent || len(events) > 0
+	at.agent = agent
+	at.quiet = true
+	if !at.skipped {
+		at.quietPolls = 0
+	}
+	at.sessionUpdated = session.timeUpdated
+	if !changed {
+		return nil, nil
+	}
+	return &provider.Update{Agent: agent, Events: events}, nil
+}
+
+// refreshFromSession applies the fields the session row owns, leaving anything
+// only messages and parts can resolve untouched.
+func refreshFromSession(agent model.Agent, session sessionRow, depth int, source string) model.Agent {
+	agent.NativeID, agent.Provider = session.id, Name
+	agent.Parent, agent.Depth = session.parentID, depth
+	agent.Cwd, agent.CLIVersion, agent.Source = session.directory, session.version, source
+	agent.Title = session.title
+	if session.agent != "" {
+		agent.Name = session.agent
+	}
+	if agent.Name != "" {
+		agent.Title = strings.TrimSuffix(agent.Title, " (@"+agent.Name+" subagent)")
+	}
+	if resolved := sessionModelID(session.model); resolved != "" {
+		agent.Model = resolved
+	}
+	agent.Tokens = model.Tokens{
+		In: int(session.tokensInput), Out: int(session.tokensOutput), Reasoning: int(session.tokensReasoning),
+		CacheRead: int(session.tokensCacheRead), CacheWrite: int(session.tokensCacheWrite),
+		Total: int(session.tokensInput + session.tokensOutput),
+	}
+	agent.Updated = laterTime(agent.Updated, unixMillis(session.timeUpdated))
+	return agent
 }
 
 // forgetDeletedSessions drops state for children that no longer exist, so a

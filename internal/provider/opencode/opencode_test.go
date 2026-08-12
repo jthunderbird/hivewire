@@ -1179,7 +1179,7 @@ func TestBacklogNormalizationSkipsHistoricalEventConstruction(t *testing.T) {
 	}
 
 	var stats normalizationStats
-	got, err := normalizeSessionMode(session, []sessionRow{session}, messages, parts, "db", nil, false, &stats)
+	got, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, false, &stats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1197,7 +1197,7 @@ func TestBacklogNormalizationSkipsHistoricalEventConstruction(t *testing.T) {
 	}
 
 	var activeStats normalizationStats
-	active, err := normalizeSessionMode(session, []sessionRow{session}, messages, parts, "db", nil, true, &activeStats)
+	active, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, true, &activeStats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2265,4 +2265,24 @@ func normalizedBodies(events []model.Event) []string {
 		result[i] = events[i].Body
 	}
 	return result
+}
+
+func TestSessionModelColumnAcceptsObjectAndBareForms(t *testing.T) {
+	cases := map[string]string{
+		`{"id":"gpt-5.6-sol","providerID":"openai","variant":"default"}`: "gpt-5.6-sol",
+		`{"modelID":"claude-opus-5","providerID":"anthropic"}`:           "claude-opus-5",
+		"gpt-5.6-sol": "gpt-5.6-sol",
+		"":            "",
+		`{"broken":`:  `{"broken":`,
+	}
+	for raw, want := range cases {
+		session := sessionRow{id: "child", parentID: "parent", model: raw, timeCreated: 1, timeUpdated: 1}
+		got, err := normalizeSession(session, []sessionRow{session}, nil, nil, "db", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.agent.Model != want {
+			t.Fatalf("model %q normalized to %q, want %q", raw, got.agent.Model, want)
+		}
+	}
 }
