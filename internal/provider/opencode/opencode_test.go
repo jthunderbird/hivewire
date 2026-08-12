@@ -1121,6 +1121,9 @@ func TestBacklogResumesWithoutReplayingExistingRows(t *testing.T) {
 	}
 	insertMessage(t, db, "child", "new-user", since.UnixMilli()+2, since.UnixMilli()+2, `{"role":"user"}`)
 	insertPart(t, db, "child", "new-user", "new-text", since.UnixMilli()+2, since.UnixMilli()+2, `{"type":"text","text":"continue"}`)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, since.UnixMilli()+2); err != nil {
+		t.Fatal(err)
+	}
 	second, err := p.Poll()
 	if err != nil || len(second) != 1 {
 		t.Fatalf("resume = %+v, %v", second, err)
@@ -1128,11 +1131,26 @@ func TestBacklogResumesWithoutReplayingExistingRows(t *testing.T) {
 	if second[0].Agent.Backlog || second[0].Agent.Status != model.StatusLive {
 		t.Fatalf("resumed agent = %+v", second[0].Agent)
 	}
+	if p.db.lastPoll.partRows != 2 {
+		t.Fatalf("resume part rows = %d, want changed historical row plus new row", p.db.lastPoll.partRows)
+	}
 	if second[0].Agent.ToolCount != 1 || second[0].Agent.EventCount != 5 {
 		t.Fatalf("resumed counts = %+v", second[0].Agent)
 	}
+	if second[0].Agent.Prompt != "historical prompt" {
+		t.Fatalf("resumed prompt = %q, want historical prompt", second[0].Agent.Prompt)
+	}
 	if kinds := normalizedKinds(second[0].Events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvUser, model.EvStatus}) {
 		t.Fatalf("resume events = %v, want only new user and live status", kinds)
+	}
+	insertMessage(t, db, "child", "new-assistant", since.UnixMilli()+3, since.UnixMilli()+3, `{"role":"assistant"}`)
+	insertPart(t, db, "child", "new-assistant", "new-tool", since.UnixMilli()+3, since.UnixMilli()+3, `{"type":"tool","tool":"bash","state":{"status":"running","input":{}}}`)
+	third, err := p.Poll()
+	if err != nil || len(third) != 1 {
+		t.Fatalf("post-resume activity = %+v, %v", third, err)
+	}
+	if third[0].Agent.ToolCount != 2 || third[0].Agent.Prompt != "historical prompt" {
+		t.Fatalf("post-resume metadata/counts = %+v", third[0].Agent)
 	}
 }
 
@@ -1259,6 +1277,73 @@ func TestPollDatabaseRecoveryReplacementAndBusyTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("same session replacement resets cursors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "opencode.db")
+		db := fixtureDB(t, path)
+		insertSession(t, db, "child", "parent", 100)
+		insertMessage(t, db, "child", "old-user", 100, 100, `{"role":"user"}`)
+		insertPart(t, db, "child", "old-user", "old-prompt", 100, 100, `{"type":"text","text":"old"}`)
+		p := New(path, 0, time.Time{})
+		if _, err := p.Poll(); err != nil {
+			t.Fatal(err)
+		}
+
+		replacementPath := filepath.Join(dir, "replacement.db")
+		replacement := fixtureDB(t, replacementPath)
+		insertSession(t, replacement, "child", "parent", 10)
+		insertMessage(t, replacement, "child", "new-user", 10, 10, `{"role":"user"}`)
+		insertPart(t, replacement, "child", "new-user", "new-prompt", 10, 10, `{"type":"text","text":"replacement"}`)
+		if err := replacement.Close(); err != nil {
+			t.Fatal(err)
+		}
+		oldPath := filepath.Join(dir, "old.db")
+		if err := os.Rename(path, oldPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacementPath, path); err != nil {
+			t.Fatal(err)
+		}
+		updates, err := p.Poll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updates) != 1 || updates[0].Agent.Prompt != "replacement" || p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 {
+			t.Fatalf("same-ID replacement = %+v, stats=%+v", updates, p.db.lastPoll)
+		}
+	})
+
+	t.Run("replacement after missing poll resets cursors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "opencode.db")
+		db := fixtureDB(t, path)
+		insertSession(t, db, "child", "parent", 100)
+		insertMessage(t, db, "child", "old-user", 100, 100, `{"role":"user"}`)
+		insertPart(t, db, "child", "old-user", "old-prompt", 100, 100, `{"type":"text","text":"old"}`)
+		p := New(path, 0, time.Time{})
+		if _, err := p.Poll(); err != nil {
+			t.Fatal(err)
+		}
+		oldPath := filepath.Join(dir, "old.db")
+		if err := os.Rename(path, oldPath); err != nil {
+			t.Fatal(err)
+		}
+		if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+			t.Fatalf("missing gap poll = %+v, %v", updates, err)
+		}
+		replacement := fixtureDB(t, path)
+		insertSession(t, replacement, "child", "parent", 10)
+		insertMessage(t, replacement, "child", "new-user", 10, 10, `{"role":"user"}`)
+		insertPart(t, replacement, "child", "new-user", "new-prompt", 10, 10, `{"type":"text","text":"replacement"}`)
+		updates, err := p.Poll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updates) != 1 || updates[0].Agent.Prompt != "replacement" {
+			t.Fatalf("post-gap replacement = %+v", updates)
+		}
+	})
+
 	t.Run("busy timeout recovers", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "opencode.db")
 		db := fixtureDB(t, path)
@@ -1341,6 +1426,156 @@ func TestLargeBacklogPollIsEventlessAndBounded(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("large backlog poll exceeded five seconds")
+	}
+}
+
+func TestPollIncrementalReadsAndBoundedBacklogState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	since := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	old := since.Add(-time.Second).UnixMilli()
+	live := since.Add(time.Second).UnixMilli()
+
+	insertSession(t, db, "backlog", "parent", old)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='backlog'`, old); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "backlog", "backlog-assistant", old, old, `{"role":"assistant","time":{"completed":1},"finish":"stop"}`)
+	for i := 0; i < 100; i++ {
+		insertPart(t, db, "backlog", "backlog-assistant", fmt.Sprintf("backlog-part-%03d", i), old, old, `{"type":"text","text":"old","time":{"end":1}}`)
+	}
+
+	insertSession(t, db, "live", "parent", live)
+	insertMessage(t, db, "live", "live-user", live, live, `{"role":"user"}`)
+	insertMessage(t, db, "live", "live-assistant", live+1, live+1, `{"role":"assistant"}`)
+	insertPart(t, db, "live", "live-user", "live-prompt", live, live, `{"type":"text","text":"prompt"}`)
+	insertPart(t, db, "live", "live-assistant", "live-text", live+2, live+2, fmt.Sprintf(`{"type":"text","text":"draft","time":{"start":%d}}`, live+2))
+
+	p := New(path, 0, since)
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.messageRows != 3 || p.db.lastPoll.partRows != 102 {
+		t.Fatalf("initial hydration rows = %+v", p.db.lastPoll)
+	}
+	if state := p.agents[Name+":backlog"].state; len(state) != 0 {
+		t.Fatalf("backlog retained %d row fingerprints", len(state))
+	}
+
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 {
+		t.Fatalf("idle poll = %+v, %v", updates, err)
+	}
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("idle poll read rows: %+v", p.db.lastPoll)
+	}
+
+	// Mutate at the existing high-water mark without touching session metadata.
+	if _, err := db.Exec(`UPDATE part SET data=? WHERE id='live-text'`, fmt.Sprintf(`{"type":"text","text":"final","time":{"start":%d,"end":%d}}`, live+2, live+3)); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 1 {
+		t.Fatalf("equal-watermark mutation rows = %+v", p.db.lastPoll)
+	}
+	if len(changed) != 1 || !reflect.DeepEqual(normalizedKinds(changed[0].Events), []model.EventKind{model.EvText}) {
+		t.Fatalf("equal-watermark mutation updates = %+v", changed)
+	}
+	if updates, err := p.Poll(); err != nil || len(updates) != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("deduped boundary poll = %+v, stats=%+v, err=%v", updates, p.db.lastPoll, err)
+	}
+
+	insertSession(t, db, "new-child", "parent", live+10)
+	insertMessage(t, db, "new-child", "new-user", live+10, live+10, `{"role":"user"}`)
+	insertPart(t, db, "new-child", "new-user", "new-prompt", live+10, live+10, `{"type":"text","text":"new prompt"}`)
+	discovered, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(discovered) != 1 || discovered[0].Agent.NativeID != "new-child" || p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 {
+		t.Fatalf("new session discovery = %+v, stats=%+v", discovered, p.db.lastPoll)
+	}
+}
+
+func TestIncrementalBacklogResumeReadsOnlyPostStartRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	since := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	old := since.Add(-time.Second).UnixMilli()
+	insertSession(t, db, "child", "parent", old)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, old); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "old-user", old, old, `{"role":"user"}`)
+	insertPart(t, db, "child", "old-user", "old-prompt", old, old, `{"type":"text","text":"old prompt"}`)
+
+	p := New(path, 0, since)
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.agents[Name+":child"].state) != 0 {
+		t.Fatal("backlog retained per-row state")
+	}
+
+	post := since.UnixMilli() + 1
+	insertMessage(t, db, "child", "new-user", post, post, `{"role":"user"}`)
+	insertPart(t, db, "child", "new-user", "new-prompt", post, post, `{"type":"text","text":"continue"}`)
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, post); err != nil {
+		t.Fatal(err)
+	}
+	updates, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.messageRows != 1 || p.db.lastPoll.partRows != 1 {
+		t.Fatalf("resume read historical rows: %+v", p.db.lastPoll)
+	}
+	if len(updates) != 1 || !reflect.DeepEqual(normalizedKinds(updates[0].Events), []model.EventKind{model.EvUser, model.EvStatus}) {
+		t.Fatalf("resume updates = %+v", updates)
+	}
+}
+
+func TestIncrementalIdlePollAppliesSessionMetadataAndIdleLifecycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Truncate(time.Millisecond).UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base, base, `{"role":"assistant"}`)
+	p := New(path, 40*time.Millisecond, time.UnixMilli(base-1))
+	if _, err := p.Poll(); err != nil {
+		t.Fatal(err)
+	}
+
+	metadataTime := time.Now().Truncate(time.Millisecond)
+	if _, err := db.Exec(`UPDATE session SET title='renamed',tokens_input=9,tokens_output=4,time_updated=? WHERE id='child'`, metadataTime.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("session-only update read content rows: %+v", p.db.lastPoll)
+	}
+	if len(metadata) != 1 || metadata[0].Agent.Title != "renamed" || metadata[0].Agent.Tokens.Total != 13 {
+		t.Fatalf("session metadata update = %+v", metadata)
+	}
+	if !metadata[0].Agent.Updated.Equal(metadataTime) {
+		t.Fatalf("session metadata Updated = %v, want %v", metadata[0].Agent.Updated, metadataTime)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	idle, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("idle transition read content rows: %+v", p.db.lastPoll)
+	}
+	if len(idle) != 1 || idle[0].Agent.Status != model.StatusDone || !reflect.DeepEqual(normalizedKinds(idle[0].Events), []model.EventKind{model.EvStatus}) {
+		t.Fatalf("idle transition = %+v", idle)
 	}
 }
 
