@@ -1953,6 +1953,32 @@ func TestDormantTerminalAgentRehydratesAfterSessionAdvance(t *testing.T) {
 	}
 }
 
+func TestTerminalAssistantErrorReleasesNoticeState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "error", base+1, base+2, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"error","error":{"message":"failed"}}`, base+2))
+	if _, err := db.Exec(`UPDATE session SET time_updated=? WHERE id='child'`, base+2); err != nil {
+		t.Fatal(err)
+	}
+	p := New(path, 0, time.UnixMilli(base-1))
+	first, err := p.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Agent.Status != model.StatusError || len(first[0].Events) != 2 || first[0].Events[0].Kind != model.EvNotice || first[0].Events[0].Body != "failed" {
+		t.Fatalf("terminal assistant error = %+v", first)
+	}
+	at := p.agents[Name+":child"]
+	if !at.dormant || len(at.state) != 0 || len(at.messageWatches) != 0 {
+		t.Fatalf("terminal assistant error retained row state: %+v", at)
+	}
+	if second, err := p.Poll(); err != nil || len(second) != 0 || p.db.lastPoll.queryCount != 1 || p.db.lastPoll.watchQueries != 0 || p.db.lastPoll.messageRows != 0 || p.db.lastPoll.partRows != 0 {
+		t.Fatalf("terminal assistant error idle = %+v stats=%+v err=%v", second, p.db.lastPoll, err)
+	}
+}
+
 func TestDormantTerminalKeepsIncompletePartWatchesUntilCompletion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "opencode.db")
 	db := fixtureDB(t, path)

@@ -19,6 +19,7 @@ type emittedPart struct {
 	textDone, reasoningDone bool
 	toolUse, toolResult     bool
 	malformed               string
+	assistantError          string
 }
 
 type normalizedSession struct {
@@ -137,6 +138,7 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 		state := prior[row.id]
 		if state.fingerprint != fingerprint {
 			state.malformed = ""
+			state.assistantError = ""
 		}
 		state.fingerprint = fingerprint
 
@@ -172,7 +174,7 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 			newestData = data
 		}
 		if data.Role == "assistant" && len(data.Error) > 0 && string(data.Error) != "null" {
-			if state.malformed != fingerprint {
+			if state.assistantError != fingerprint {
 				result.eventCount++
 				if emitEvents {
 					body := assistantError(data.Error)
@@ -192,7 +194,7 @@ func normalizeSessionMode(session sessionRow, sessions []sessionRow, messages []
 					})
 					recordEventGroup(stats)
 				}
-				state.malformed = fingerprint
+				state.assistantError = fingerprint
 			}
 		}
 		result.state[row.id] = state
