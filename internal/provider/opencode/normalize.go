@@ -230,9 +230,9 @@ func normalizeSession(session sessionRow, sessions []sessionRow, messages []mess
 					}
 					if !state.user {
 						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvUser, data.Text))
+						state.user = true
 					}
 				}
-				state.user = true
 			} else if hasMessage && message.Role == "assistant" && data.Time.End != nil && strings.TrimSpace(data.Text) != "" {
 				if !state.textDone {
 					groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvText, data.Text))

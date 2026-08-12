@@ -719,6 +719,58 @@ func TestNormalizeFingerprintChangesPreserveEmittedPhases(t *testing.T) {
 	}
 }
 
+func TestNormalizeDeferredUserTextEmitsWhenEligible(t *testing.T) {
+	tests := []struct {
+		name, initial, eligible string
+	}{
+		{
+			name:     "synthetic becomes eligible",
+			initial:  `{"type":"text","text":"prompt","synthetic":true,"time":{"start":10,"end":11}}`,
+			eligible: `{"type":"text","text":"prompt","synthetic":false,"time":{"start":10,"end":11}}`,
+		},
+		{
+			name:     "empty becomes populated",
+			initial:  `{"type":"text","text":"","time":{"start":10,"end":11}}`,
+			eligible: `{"type":"text","text":"prompt","time":{"start":10,"end":11}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
+			message := messageRow{id: "user-message", timeCreated: 2, data: `{"role":"user"}`}
+			part := partRow{id: "user-part", messageID: message.id, timeCreated: 10, timeUpdated: 11, data: tt.initial}
+
+			first, err := normalizeSession(session, []sessionRow{session}, []messageRow{message}, []partRow{part}, "db", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(first.events) != 0 || first.state[part.id].user {
+				t.Fatalf("ineligible row emitted or completed user phase: events=%+v state=%+v", first.events, first.state[part.id])
+			}
+
+			part.data = tt.eligible
+			second, err := normalizeSession(session, []sessionRow{session}, []messageRow{message}, []partRow{part}, "db", first.state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(second.events) != 1 || second.events[0].Kind != model.EvUser || second.events[0].Body != "prompt" {
+				t.Fatalf("eligible transition events = %+v", second.events)
+			}
+			if !second.state[part.id].user {
+				t.Fatalf("emitted user phase not recorded: %+v", second.state[part.id])
+			}
+
+			third, err := normalizeSession(session, []sessionRow{session}, []messageRow{message}, []partRow{part}, "db", second.state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(third.events) != 0 {
+				t.Fatalf("eligible user event repeated: %+v", third.events)
+			}
+		})
+	}
+}
+
 func TestNormalizeUnsupportedPartIgnoresConflictingSupportedFields(t *testing.T) {
 	session := sessionRow{id: "child", parentID: "parent", timeCreated: 1}
 	message := messageRow{id: "a", timeCreated: 2, data: `{"role":"assistant"}`}
