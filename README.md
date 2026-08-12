@@ -2,13 +2,14 @@
   <img src="internal/web/hivewire-logo.png" alt="hivewire" width="420">
 </p>
 
-Live, raw view of what your **Claude Code** and **Codex** subagents are doing — four
-panes at a time, in a terminal UI and a LAN-reachable web page, from one binary.
+Live, raw view of what your **Claude Code**, **Codex** and **OpenCode** subagents are
+doing — four panes at a time, in a terminal UI and a LAN-reachable web page, from one
+binary.
 
 Existing agent dashboards are hook-fed event feeds. Hooks only carry tool names and
 tool results, so they structurally cannot show assistant text, reasoning, or token
-usage. hivewire instead tails the transcripts both CLIs already write, which contain
-everything — and needs no configuration in either tool to do it.
+usage. hivewire instead reads the history all three CLIs already keep, which contains
+everything — and needs no configuration in any of them to do it.
 
 
 ## Run it
@@ -28,16 +29,16 @@ it does not replay everything you have ever run.
 
 ## Pane details
 
-| Field | Claude | Codex |
-|---|---|---|
-| status dot | green live · gray done · red error | same |
-| provider · model | `message.model` | `turn_context.model` |
-| agent | `agentType` | `basename(agent_path)` + nickname |
-| title | Task `description` | first task message |
-| depth | `spawnDepth` | `thread_spawn.depth` |
-| tokens | summed `usage` | `token_count` totals + context-window % |
-| tools, elapsed | derived | derived |
-| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort |
+| Field | Claude | Codex | OpenCode |
+|---|---|---|---|
+| status dot | green live · gray done · red error | same | same |
+| provider · model | `message.model` | `turn_context.model` | `session.model` |
+| agent | `agentType` | `basename(agent_path)` + nickname | `session.agent` |
+| title | Task `description` | first task message | `session.title` |
+| depth | `spawnDepth` | `thread_spawn.depth` | parent chain length |
+| tokens | summed `usage` | `token_count` totals + context-window % | `session.tokens_*` |
+| tools, elapsed | derived | derived | derived |
+| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort | `session.directory`, CLI version |
 
 ### TUI
 
@@ -53,7 +54,7 @@ it does not replay everything you have ever run.
 
 ## Where the data comes from
 
-No hooks, no config changes to Claude Code or Codex, nothing to install in either tool.
+No hooks, no config changes to any of the CLIs, nothing to install in them.
 
 **Claude Code** writes one dedicated JSONL per subagent:
 
@@ -77,8 +78,24 @@ same first line carries `parent_thread_id`, `depth`, `agent_path` and `agent_nic
 Completion comes from the rollout's `task_complete` event. (`thread_spawn_edges.status`
 in `~/.codex/state_5.sqlite` stays `"open"` after completion, so it is not used.)
 
-Adding a provider means one file implementing `provider.Provider` — discover
-transcripts, emit `model.Agent` + `model.Event`.
+**OpenCode** keeps no per-subagent transcript. Everything lives in its SQLite
+database:
+
+```
+~/.local/share/opencode/opencode.db      # session, message, part tables
+```
+
+A subagent is a session with a non-empty `parent_id`. hivewire opens the database
+read-only (`mode=ro`, `query_only`, pure-Go driver — no CGO, no `sqlite3` binary,
+never a migration) and follows each child session with a cursor over `time_updated`.
+Rows mutate in place as a turn runs, so a tool part is streamed as an invocation when
+it first appears and as a result once it completes. Completion comes from the newest
+message's `finish` and `time.completed`, with the same idle timer as a fallback.
+Because text and reasoning are persisted per completed part rather than per token,
+OpenCode output appears at part boundaries, not character by character.
+
+Adding a provider means implementing `provider.Provider` — discover agents, emit
+`model.Agent` + `model.Event`.
 
 ## Nothing is truncated
 
@@ -137,9 +154,10 @@ dropped-events warning — those two never go silent.
 
 ## History
 
-Both CLIs keep their transcripts indefinitely, so hivewire copies nothing. The
+Every CLI keeps its own history indefinitely, so hivewire copies nothing. The
 history browser is an index (`~/.local/state/hivewire/index.json`, rebuildable) over
-files that already exist, and replay re-reads the originals.
+records that already exist, and replay re-reads the original transcript — or, for
+OpenCode, the original database rows.
 
 The search box queries the server, so it matches **every** indexed run rather than
 the page on screen, and every whitespace-separated term must match. Fields
@@ -180,6 +198,7 @@ poll_ms      = 250
 idle_done_sec = 300      # fallback only; real completion comes from the transcripts
 claude_root  = "~/.claude/projects"
 codex_root   = "~/.codex/sessions"
+opencode_db  = "~/.local/share/opencode/opencode.db"
 state_dir    = "~/.local/state/hivewire"
 ```
 
@@ -190,3 +209,9 @@ it is meant to be opened from another machine on your LAN. Anyone who can reach 
 port can read your agent transcripts, including prompts, file contents, and anything
 an agent printed. Run it on a trusted network only. Overflow-file reads are confined
 to the configured transcript roots, with symlinks resolved before the check.
+
+hivewire never writes to the OpenCode database: it is opened read-only with
+`query_only` set, and a missing database is simply no OpenCode agents rather than an
+error. Only the `tool-output` directory beside the database is an allowed
+overflow root — the database's own directory is not, because it also holds
+`auth.json`.
