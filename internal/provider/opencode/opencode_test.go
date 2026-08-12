@@ -2164,6 +2164,93 @@ func TestDeletedRowsDoNotBreakPolling(t *testing.T) {
 	}
 }
 
+func TestReplayRebuildsCompletedSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().Truncate(time.Millisecond).UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	if _, err := db.Exec(`UPDATE session SET agent='general',model='gpt-5.6-sol',title='Audit parser (@general subagent)',tokens_input=100,tokens_output=20,time_updated=? WHERE id='child'`, base+90); err != nil {
+		t.Fatal(err)
+	}
+	insertMessage(t, db, "child", "user", base+10, base+10, `{"role":"user"}`)
+	insertMessage(t, db, "child", "assistant", base+20, base+90, fmt.Sprintf(`{"role":"assistant","time":{"completed":%d},"finish":"stop"}`, base+90))
+	insertPart(t, db, "child", "user", "prompt", base+10, base+10, `{"type":"text","text":"audit the parser"}`)
+	insertPart(t, db, "child", "assistant", "reason", base+30, base+40, fmt.Sprintf(`{"type":"reasoning","text":"inspecting","time":{"start":%d,"end":%d}}`, base+30, base+40))
+	insertPart(t, db, "child", "assistant", "tool", base+50, base+60, fmt.Sprintf(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok","time":{"start":%d,"end":%d}}}`, base+50, base+60))
+	insertPart(t, db, "child", "assistant", "answer", base+70, base+80, fmt.Sprintf(`{"type":"text","text":"All checks pass.","time":{"start":%d,"end":%d}}`, base+70, base+80))
+	insertPart(t, db, "child", "assistant", "unsupported", base+75, base+75, `{"type":"step-finish","reason":"stop"}`)
+
+	agent, events, err := Replay(path, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.ID != "opencode:child" || agent.NativeID != "child" || agent.Provider != Name {
+		t.Fatalf("replayed identity = %+v", agent)
+	}
+	if agent.Name != "general" || agent.Title != "Audit parser" || agent.Model != "gpt-5.6-sol" || agent.Prompt != "audit the parser" {
+		t.Fatalf("replayed metadata = %+v", agent)
+	}
+	if agent.Status != model.StatusDone || agent.Tokens.Total != 120 || agent.ToolCount != 1 || agent.DurationMS != 90 {
+		t.Fatalf("replayed status/counts = %+v", agent)
+	}
+	wantKinds := []model.EventKind{model.EvUser, model.EvReasoning, model.EvToolUse, model.EvToolResult, model.EvText, model.EvStatus}
+	if kinds := normalizedKinds(events); !reflect.DeepEqual(kinds, wantKinds) {
+		t.Fatalf("replayed kinds = %v, want %v", kinds, wantKinds)
+	}
+	if agent.EventCount != len(events) {
+		t.Fatalf("event count = %d, events = %d", agent.EventCount, len(events))
+	}
+	for i, event := range events {
+		if event.Seq != uint64(i+1) || event.AgentID != agent.ID {
+			t.Fatalf("event %d = %+v", i, event)
+		}
+	}
+	if events[len(events)-1].TS.UnixMilli() != base+90 {
+		t.Fatalf("terminal status time = %v", events[len(events)-1].TS)
+	}
+}
+
+func TestReplayLiveSessionOmitsTerminalStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertMessage(t, db, "child", "assistant", base+1, base+1, `{"role":"assistant","finish":"tool-calls"}`)
+	insertPart(t, db, "child", "assistant", "text", base+2, base+3, fmt.Sprintf(`{"type":"text","text":"working","time":{"start":%d,"end":%d}}`, base+2, base+3))
+
+	agent, events, err := Replay(path, "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status != model.StatusLive {
+		t.Fatalf("replayed status = %q", agent.Status)
+	}
+	if kinds := normalizedKinds(events); !reflect.DeepEqual(kinds, []model.EventKind{model.EvText}) {
+		t.Fatalf("replayed kinds = %v", kinds)
+	}
+}
+
+func TestReplayRejectsUnknownAndEmptySessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode.db")
+	db := fixtureDB(t, path)
+	base := time.Now().UnixMilli()
+	insertSession(t, db, "child", "parent", base)
+	insertSession(t, db, "root", "", base)
+
+	if _, _, err := Replay(path, ""); err == nil || !strings.Contains(err.Error(), "empty session id") {
+		t.Fatalf("empty session id error = %v", err)
+	}
+	if _, _, err := Replay(path, "missing"); err == nil || !strings.Contains(err.Error(), "no child session") {
+		t.Fatalf("missing session error = %v", err)
+	}
+	if _, _, err := Replay(path, "root"); err == nil || !strings.Contains(err.Error(), "no child session") {
+		t.Fatalf("top-level session error = %v", err)
+	}
+	if _, _, err := Replay(filepath.Join(t.TempDir(), "absent.db"), "child"); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing database error = %v", err)
+	}
+}
+
 func normalizedKinds(events []model.Event) []model.EventKind {
 	result := make([]model.EventKind, len(events))
 	for i := range events {
