@@ -1178,13 +1178,12 @@ func TestBacklogNormalizationSkipsHistoricalEventConstruction(t *testing.T) {
 		})
 	}
 
-	var stats normalizationStats
-	got, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, false, &stats)
+	got, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.events) != 0 || stats.eventGroups != 0 || stats.toolBodies != 0 {
-		t.Fatalf("metadata mode constructed events: events=%d stats=%+v", len(got.events), stats)
+	if len(got.events) != 0 {
+		t.Fatalf("metadata mode constructed %d events", len(got.events))
 	}
 	if got.agent.Prompt != "historical prompt" || got.agent.ToolCount != 2000 || got.eventCount != 4001 {
 		t.Fatalf("metadata mode agent/counts = %+v, eventCount=%d", got.agent, got.eventCount)
@@ -1196,13 +1195,12 @@ func TestBacklogNormalizationSkipsHistoricalEventConstruction(t *testing.T) {
 		}
 	}
 
-	var activeStats normalizationStats
-	active, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, true, &activeStats)
+	active, err := normalizeSessionMode(session, parentIndex([]sessionRow{session}), messages, parts, "db", nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(active.events) != 4001 || activeStats.eventGroups != 2001 || activeStats.toolBodies != 2000 {
-		t.Fatalf("event instrumentation calibration failed: events=%d stats=%+v", len(active.events), activeStats)
+	if len(active.events) != 4001 {
+		t.Fatalf("streaming mode built %d events, want 4001", len(active.events))
 	}
 }
 

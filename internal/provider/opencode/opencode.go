@@ -166,7 +166,7 @@ func (p *Provider) applySession(session sessionRow, snapshot dbSnapshot, parents
 		backlog = at.agent.Backlog && len(messages) == 0 && len(parts) == 0
 	}
 
-	normalized, err := normalizeSessionMode(session, parents, messages, parts, p.db.path, prior, !backlog, nil)
+	normalized, err := normalizeSessionMode(session, parents, messages, parts, p.db.path, prior, !backlog)
 	if err != nil {
 		return nil, err
 	}

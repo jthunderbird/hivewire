@@ -35,11 +35,6 @@ type normalizedSession struct {
 	statusTime time.Time
 }
 
-type normalizationStats struct {
-	eventGroups int
-	toolBodies  int
-}
-
 type messageData struct {
 	Role    string          `json:"role"`
 	Agent   string          `json:"agent"`
@@ -89,10 +84,13 @@ type eventGroup struct {
 }
 
 func normalizeSession(session sessionRow, sessions []sessionRow, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart) (normalizedSession, error) {
-	return normalizeSessionMode(session, parentIndex(sessions), messages, parts, source, prior, true, nil)
+	return normalizeSessionMode(session, parentIndex(sessions), messages, parts, source, prior, true)
 }
 
-func normalizeSessionMode(session sessionRow, parents map[string]string, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart, emitEvents bool, stats *normalizationStats) (normalizedSession, error) {
+// normalizeSessionMode folds rows into an agent plus the events they produce.
+// With emitEvents false it records which phases exist without building their
+// bodies, which is how a pre-existing session is indexed without replaying it.
+func normalizeSessionMode(session sessionRow, parents map[string]string, messages []messageRow, parts []partRow, source string, prior map[string]emittedPart, emitEvents bool) (normalizedSession, error) {
 	depth, err := sessionDepth(session, parents)
 	if err != nil {
 		return normalizedSession{}, err
@@ -151,7 +149,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 				if emitEvents {
 					notice := malformedNotice(result.agent.ID, "message", row.id, err, row.timeUpdated, row.timeCreated)
 					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
-					recordEventGroup(stats)
 				}
 				state.malformed = fingerprint
 			}
@@ -191,7 +188,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 							Err:     true,
 						}},
 					})
-					recordEventGroup(stats)
 				}
 				state.assistantError = fingerprint
 			}
@@ -216,7 +212,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 				if emitEvents {
 					notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
 					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
-					recordEventGroup(stats)
 				}
 				state.malformed = fingerprint
 			}
@@ -235,7 +230,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 				if emitEvents {
 					notice := malformedNotice(result.agent.ID, "part", row.id, err, row.timeUpdated, row.timeCreated)
 					groups = append(groups, eventGroup{effective: eventMillis(notice.TS), created: row.timeCreated, rowID: row.id, events: []model.Event{notice}})
-					recordEventGroup(stats)
 				}
 				state.malformed = fingerprint
 			}
@@ -255,7 +249,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 						result.eventCount++
 						if emitEvents {
 							groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvUser, data.Text))
-							recordEventGroup(stats)
 						}
 						state.user = true
 					}
@@ -265,7 +258,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 					result.eventCount++
 					if emitEvents {
 						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvText, data.Text))
-						recordEventGroup(stats)
 					}
 				}
 				state.textDone = true
@@ -281,7 +273,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 					result.eventCount++
 					if emitEvents {
 						groups = append(groups, textGroup(result.agent.ID, row, data.Time.Start, model.EvReasoning, data.Text))
-						recordEventGroup(stats)
 					}
 				}
 				state.reasoningDone = true
@@ -301,9 +292,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 				result.eventCount++
 				if emitEvents {
 					body := provider.PrettyJSON(data.State.Input)
-					if stats != nil {
-						stats.toolBodies++
-					}
 					events = append(events, model.Event{
 						AgentID: result.agent.ID,
 						TS:      unixMillis(useTS),
@@ -352,7 +340,6 @@ func normalizeSessionMode(session sessionRow, parents map[string]string, message
 			}
 			if len(events) > 0 {
 				groups = append(groups, eventGroup{effective: groupTime, created: row.timeCreated, rowID: row.id, events: events})
-				recordEventGroup(stats)
 			}
 		}
 		result.state[row.id] = state
@@ -438,12 +425,6 @@ func sessionDepth(session sessionRow, parents map[string]string) (int, error) {
 		parent = next
 	}
 	return depth, nil
-}
-
-func recordEventGroup(stats *normalizationStats) {
-	if stats != nil {
-		stats.eventGroups++
-	}
 }
 
 func textGroup(agentID string, row partRow, start int64, kind model.EventKind, body string) eventGroup {
