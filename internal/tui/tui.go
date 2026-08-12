@@ -566,10 +566,23 @@ func truncate(s string, w int) string {
 func metaLine(a model.Agent) string {
 	var parts []string
 	if a.Depth > 0 {
-		parts = append(parts, fmt.Sprintf("d%d", a.Depth))
+		depth := fmt.Sprintf("d%d", a.Depth)
+		// Depth says an agent was nested; the parent's name says by whom.
+		if a.ParentLabel != "" {
+			depth += " · in " + a.ParentLabel
+		}
+		parts = append(parts, depth)
 	}
 	if a.Tokens.Total > 0 {
-		parts = append(parts, fmt.Sprintf("%.1fk tok", float64(a.Tokens.Total)/1000))
+		tok := fmt.Sprintf("%.1fk tok", float64(a.Tokens.Total)/1000)
+		// Only Codex reports the model's context window; an unknown one is
+		// shown as unknown rather than as a percentage of nothing.
+		if a.Tokens.ContextWindow > 0 {
+			tok += fmt.Sprintf(" (%d%% ctx)", a.Tokens.Total*100/a.Tokens.ContextWindow)
+		} else {
+			tok += " (ctx --)"
+		}
+		parts = append(parts, tok)
 	}
 	if a.ToolCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d tools", a.ToolCount))

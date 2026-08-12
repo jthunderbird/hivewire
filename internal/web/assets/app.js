@@ -29,8 +29,20 @@ const tokens = (t) => {
   if (!t || !t.total) return '';
   const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
   let s = k(t.total) + ' tok';
-  if (t.context_window) s += ` (${Math.round((t.total / t.context_window) * 100)}% ctx)`;
+  // Only Codex reports the model's context window; say so rather than implying
+  // a full window or an empty one.
+  s += t.context_window
+    ? ` (${Math.round((t.total / t.context_window) * 100)}% ctx)`
+    : ' (ctx --)';
   return s;
+};
+
+// nesting describes where an agent sits in the spawn tree: depth alone for a
+// subagent of a session, and the spawning agent's name when it was nested by
+// another subagent.
+const nesting = (a) => {
+  if (!a.depth) return '';
+  return a.parentLabel ? `d${a.depth} · nested in ${a.parentLabel}` : 'd' + a.depth;
 };
 
 const elapsed = (a) => {
@@ -145,7 +157,8 @@ function renderPane(slotIdx) {
   if (agent.title) head.appendChild(el('span', 'head-meta', `"${agent.title}"`));
 
   const meta = [];
-  if (agent.depth) meta.push('d' + agent.depth);
+  const nest = nesting(agent);
+  if (nest) meta.push(nest);
   const tk = tokens(agent.tokens);
   if (tk) meta.push(tk);
   if (agent.toolCount) meta.push(agent.toolCount + ' tools');
@@ -334,6 +347,8 @@ function historyRow(r) {
   const li = el('li', 'st-' + (r.status || 'done'));
   li.appendChild(el('div', null, `${r.provider} · ${r.name || r.id}`));
   const sub = [new Date(r.started).toLocaleString(), r.model];
+  const nest = nesting(r);
+  if (nest) sub.push(nest);
   if (r.title) sub.push('"' + r.title + '"');
   li.appendChild(el('div', 'muted', sub.filter(Boolean).join(' · ')));
   if (r.prompt) li.appendChild(el('div', 'muted', clip(r.prompt, 110)));

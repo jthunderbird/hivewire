@@ -2,9 +2,9 @@
   <img src="internal/web/hivewire-logo.png" alt="hivewire" width="420">
 </p>
 
-Live, raw view of what your **Claude Code**, **Codex** and **OpenCode** subagents are
-doing — four panes at a time, in a terminal UI and a LAN-reachable web page, from one
-binary.
+Live, raw view of what your **Claude Code**, **Codex**, **OpenCode** and **omp**
+subagents are doing — four panes at a time, in a terminal UI and a LAN-reachable web
+page, from one binary.
 
 Existing agent dashboards are hook-fed event feeds. Hooks only carry tool names and
 tool results, so they structurally cannot show assistant text, reasoning, or token
@@ -29,16 +29,20 @@ it does not replay everything you have ever run.
 
 ## Pane details
 
-| Field | Claude | Codex | OpenCode |
-|---|---|---|---|
-| status dot | green live · gray done · red error | same | same |
-| provider · model | `message.model` | `turn_context.model` | `session.model` |
-| agent | `agentType` | `basename(agent_path)` + nickname | `session.agent` |
-| title | Task `description` | first task message | `session.title` |
-| depth | `spawnDepth` | `thread_spawn.depth` | parent chain length |
-| tokens | summed `usage` | `token_count` totals + context-window % | `session.tokens_*` |
-| tools, elapsed | derived | derived | derived |
-| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort | `session.directory`, CLI version |
+| Field | Claude | Codex | OpenCode | omp |
+|---|---|---|---|---|
+| status dot | green live · gray done · red error | same | same | same |
+| provider · model | `message.model` | `turn_context.model` | `session.model` | `resolvedModel` |
+| agent | `agentType` | `basename(agent_path)` + nickname | `session.agent` | `session_init.agent` + job id |
+| title | Task `description` | first task message | `session.title` | hub job label, else the task |
+| depth | `spawnDepth` | `thread_spawn.depth` | parent chain length | artifacts-directory nesting |
+| tokens | summed `usage` | `token_count` totals + context-window % | `session.tokens_*` | summed `usage` |
+| tools, elapsed | derived | derived | derived | derived |
+| context | `cwd`, git branch, `sessionKind`, `effort` | `cwd`, sandbox policy, approval mode, reasoning effort | `session.directory`, CLI version | `cwd`, thinking level |
+
+Only Codex reports the model's context window, so the token figure reads
+`12.4k tok (34% ctx)` there and `12.4k tok (ctx --)` everywhere else rather than
+implying a window nobody published.
 
 ### TUI
 
@@ -94,8 +98,35 @@ message's `finish` and `time.completed`, with the same idle timer as a fallback.
 Because text and reasoning are persisted per completed part rather than per token,
 OpenCode output appears at part boundaries, not character by character.
 
+**omp** writes one JSONL per session, and a subagent's transcript lives in the
+artifacts directory named after its parent's session file:
+
+```
+~/.omp/agent/sessions/<bucket>/<ts>_<sessionId>.jsonl        ← parent session
+~/.omp/agent/sessions/<bucket>/<ts>_<sessionId>/<id>.jsonl   ← subagent
+```
+
+An omp subagent transcript is self-describing: its `session_init` line carries the
+agent type, the resolved model and the entire task it was handed, so no parent read
+is needed for metadata. Completion is read from the hidden `yield` tool every
+subagent must finish through, and from the parent's settled hub job — which also
+supplies the one-line label omp generates for the run.
+
 Adding a provider means implementing `provider.Provider` — discover agents, emit
 `model.Agent` + `model.Event`.
+
+## Nesting
+
+A subagent can spawn subagents. hivewire records how deep a run sat in the spawn
+tree and, when the thing that spawned it is itself an agent hivewire tracks, names
+it: a pane reads `d2 · in Explore (Lead)` instead of only `d2`, and the same note
+appears on the history row. A run spawned directly by a top-level session shows its
+depth alone, because there is no agent to name.
+
+Depth comes from `spawnDepth` (Claude), `thread_spawn.depth` (Codex), the
+`parent_id` chain (OpenCode) and artifacts-directory nesting (omp). For Claude the
+spawning agent is matched through the `Task` tool_use id its parent recorded, so a
+nested run points at the agent that launched it rather than at the session.
 
 ## Nothing is truncated
 
@@ -200,6 +231,7 @@ idle_done_sec = 300      # fallback only; real completion comes from the transcr
 claude_root  = "~/.claude/projects"
 codex_root   = "~/.codex/sessions"
 opencode_db  = "~/.local/share/opencode/opencode.db"
+omp_root     = "~/.omp/agent/sessions"
 state_dir    = "~/.local/state/hivewire"
 ```
 
@@ -215,4 +247,5 @@ hivewire never writes to the OpenCode database: it is opened read-only with
 `query_only` set, and a missing database is simply no OpenCode agents rather than an
 error. Only the `tool-output` directory beside the database is an allowed
 overflow root — the database's own directory is not, because it also holds
-`auth.json`.
+`auth.json`. omp gets no overflow root at all: it never truncates a tool result to a
+separate file, and its data directory holds a credential database.
