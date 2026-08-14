@@ -6,6 +6,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/jtaylor/hivewire/internal/hub"
 	"github.com/jtaylor/hivewire/internal/model"
@@ -49,6 +51,52 @@ func liveAgent() provider.Update {
 			{Kind: model.EvToolUse, Tool: "Bash", Header: "Bash  wc -l tui.go", Body: `{"command":"wc -l tui.go"}`, Lines: 1, TS: time.Now()},
 			{Kind: model.EvToolResult, Header: "612 tui.go", Body: "612 tui.go", Lines: 1, TS: time.Now()},
 		},
+	}
+}
+
+func TestANSIColouredOutputIsPreservedNotWrappedAsGarbage(t *testing.T) {
+	m, h := newTestModel(t)
+	colored := "\x1b[32m[OK]\x1b[0m gsp-dev-2: gsp-ui dev image ready"
+	h.Apply(provider.Update{
+		Agent: model.Agent{
+			ID: "claude-background:t1", NativeID: "t1", Provider: "claude-background",
+			Name: "bash", Status: model.StatusLive, Started: time.Now(), Updated: time.Now(),
+		},
+		Events: []model.Event{
+			{Kind: model.EvToolResult, Header: colored, Body: colored, Lines: 1, TS: time.Now()},
+		},
+	})
+	drain(m, h)
+
+	out := m.View()
+	if !strings.Contains(out, "\x1b[32m") {
+		t.Errorf("expected the source's own SGR code to survive, got:\n%s", out)
+	}
+	if strings.Contains(out, "␛") || strings.Contains(out, "\\x1b") {
+		t.Errorf("escape byte leaked as literal text instead of a real control byte:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if w := lipgloss.Width(line); w > testW {
+			t.Errorf("line width %d exceeds terminal width %d — ANSI bytes were probably counted as visible cells: %q", w, testW, line)
+		}
+	}
+}
+
+func TestANSIWrapResetsAtEveryLineSoColourCannotBleed(t *testing.T) {
+	lines := ansiWrap("\x1b[31mred text with no trailing reset", 10)
+	for _, l := range lines {
+		if !strings.HasSuffix(l, ansi.ResetStyle) {
+			t.Errorf("wrapped line %q does not end with a reset", l)
+		}
+	}
+}
+
+func TestHasANSI(t *testing.T) {
+	if hasANSI("plain text") {
+		t.Error("plain text should not be detected as ANSI")
+	}
+	if !hasANSI("\x1b[32mgreen\x1b[0m") {
+		t.Error("text with an escape byte should be detected as ANSI")
 	}
 }
 

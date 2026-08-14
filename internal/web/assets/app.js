@@ -114,6 +114,119 @@ function initGutters() {
 
 const clamp = (pct) => Math.min(88, Math.max(12, pct));
 
+// -------------------------------------------------------------------- ansi
+// Tool and shell output is often colour-coded (make, kubectl, colored test
+// runners, gspcli, …). Bodies keep those raw SGR escape codes verbatim, like
+// everything else hivewire never touches, so this turns them into <span>s
+// instead of the browser showing the escape bytes as literal text.
+
+const hasANSI = (s) => !!s && s.indexOf('\x1b[') !== -1;
+
+// A GitHub Dark terminal palette, so ANSI colours read consistently with the
+// rest of hivewire's own (identically GitHub-Dark-derived) accent colours.
+const ANSI_FG = ['#484f58', '#ff7b72', '#3fb950', '#d29922', '#58a6ff', '#bc8cff', '#39c5cf', '#b1bac4'];
+const ANSI_BRIGHT = ['#6e7681', '#ffa198', '#56d364', '#e3b341', '#79c0ff', '#d2a8ff', '#56d4dd', '#f0f6fc'];
+
+function ansi256(n) {
+  if (n < 8) return ANSI_FG[n];
+  if (n < 16) return ANSI_BRIGHT[n - 8];
+  if (n < 232) {
+    n -= 16;
+    const lvl = (v) => (v === 0 ? 0 : v * 40 + 55);
+    return `rgb(${lvl(Math.floor(n / 36))},${lvl(Math.floor((n / 6) % 6))},${lvl(n % 6)})`;
+  }
+  const v = (n - 232) * 10 + 8;
+  return `rgb(${v},${v},${v})`;
+}
+
+// extendedColor reads the 256-colour (38;5;N) or truecolor (38;2;R;G;B) form
+// that can follow a 38/48 code, returning the CSS colour and how many extra
+// codes it consumed.
+function extendedColor(codes, i) {
+  if (codes[i] === 5 && codes[i + 1] !== undefined) return [ansi256(codes[i + 1]), 2];
+  if (codes[i] === 2 && codes[i + 3] !== undefined) return [`rgb(${codes[i + 1]},${codes[i + 2]},${codes[i + 3]})`, 4];
+  return [null, 0];
+}
+
+function applySGR(s, codes) {
+  for (let i = 0; i < codes.length; i++) {
+    const c = codes[i];
+    if (c === 0) Object.keys(s).forEach((k) => delete s[k]);
+    else if (c === 1) s.bold = true;
+    else if (c === 2) s.dim = true;
+    else if (c === 3) s.italic = true;
+    else if (c === 4) s.underline = true;
+    else if (c === 7) s.inverse = true;
+    else if (c === 9) s.strike = true;
+    else if (c === 22) { delete s.bold; delete s.dim; }
+    else if (c === 23) delete s.italic;
+    else if (c === 24) delete s.underline;
+    else if (c === 27) delete s.inverse;
+    else if (c === 29) delete s.strike;
+    else if (c >= 30 && c <= 37) s.fg = ANSI_FG[c - 30];
+    else if (c === 38) { const [color, n] = extendedColor(codes, i + 1); if (color) s.fg = color; i += n; }
+    else if (c === 39) delete s.fg;
+    else if (c >= 40 && c <= 47) s.bg = ANSI_FG[c - 40];
+    else if (c === 48) { const [color, n] = extendedColor(codes, i + 1); if (color) s.bg = color; i += n; }
+    else if (c === 49) delete s.bg;
+    else if (c >= 90 && c <= 97) s.fg = ANSI_BRIGHT[c - 90];
+    else if (c >= 100 && c <= 107) s.bg = ANSI_BRIGHT[c - 100];
+  }
+}
+
+function sgrStyle(s) {
+  let fg = s.fg, bg = s.bg;
+  if (s.inverse) [fg, bg] = [bg || 'var(--bg)', fg || 'var(--fg)'];
+  const decl = [];
+  if (fg) decl.push(`color:${fg}`);
+  if (bg) decl.push(`background:${bg}`);
+  if (s.bold) decl.push('font-weight:700');
+  if (s.dim) decl.push('opacity:.65');
+  if (s.italic) decl.push('font-style:italic');
+  if (s.underline && s.strike) decl.push('text-decoration:underline line-through');
+  else if (s.underline) decl.push('text-decoration:underline');
+  else if (s.strike) decl.push('text-decoration:line-through');
+  return decl.join(';');
+}
+
+const escapeHTML = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// ANSI_RE matches an SGR sequence (captured) or any other CSI/OSC escape,
+// which is dropped rather than shown — cursor moves and the like mean
+// nothing once stdout has already been captured into a static transcript.
+const ANSI_RE = /\x1b\[([0-9;]*)m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]/g;
+
+// ansiToHTML converts a string carrying raw SGR escape codes into HTML with
+// equivalent <span> runs. Only used when hasANSI already found an escape
+// byte, so plain output keeps the cheaper textContent path.
+function ansiToHTML(text) {
+  let out = '';
+  let cur = {};
+  let last = 0;
+  const flush = (chunk) => {
+    if (!chunk) return;
+    const style = sgrStyle(cur);
+    out += style ? `<span style="${style}">${escapeHTML(chunk)}</span>` : escapeHTML(chunk);
+  };
+
+  ANSI_RE.lastIndex = 0;
+  let m;
+  while ((m = ANSI_RE.exec(text))) {
+    flush(text.slice(last, m.index));
+    last = ANSI_RE.lastIndex;
+    if (m[1] !== undefined) applySGR(cur, m[1] === '' ? [0] : m[1].split(';').map(Number));
+  }
+  flush(text.slice(last));
+  return out;
+}
+
+// setBody fills a <pre> with text, rendering ANSI colour codes as HTML when
+// present instead of the safe-but-plain textContent path.
+function setBody(pre, text) {
+  if (hasANSI(text)) pre.innerHTML = ansiToHTML(text);
+  else pre.textContent = text;
+}
+
 // ------------------------------------------------------------------ render
 
 function renderBar() {
@@ -201,7 +314,13 @@ function renderEvent(e) {
   head.appendChild(el('span', 'ts', clock(e.ts) + ' '));
   if (collapsible) head.appendChild(el('span', 'chev', (open ? '▾ ' : '▸ ')));
   head.appendChild(el('span', 'kindtag', tag(e) + ' '));
-  head.appendChild(document.createTextNode(e.header || ''));
+  if (hasANSI(e.header)) {
+    const h = el('span');
+    h.innerHTML = ansiToHTML(e.header);
+    head.appendChild(h);
+  } else {
+    head.appendChild(document.createTextNode(e.header || ''));
+  }
   if ((e.lines || 0) > 1) head.appendChild(el('span', 'lines', `  (${e.lines} lines)`));
   head.addEventListener('click', () => {
     if (state.expanded.has(e.seq)) state.expanded.delete(e.seq);
@@ -221,7 +340,8 @@ function renderEvent(e) {
       try {
         const r = await fetch('/api/overflow?path=' + encodeURIComponent(e.overflow.path));
         const text = await r.text();
-        const pre = el('pre', 'body', text);
+        const pre = el('pre', 'body');
+        setBody(pre, text);
         note.after(pre);
         btn.remove();
       } catch (err) {
@@ -232,7 +352,11 @@ function renderEvent(e) {
     wrap.appendChild(note);
   }
 
-  if (open && e.body) wrap.appendChild(el('pre', 'body', e.body));
+  if (open && e.body) {
+    const pre = el('pre', 'body');
+    setBody(pre, e.body);
+    wrap.appendChild(pre);
+  }
   return wrap;
 }
 

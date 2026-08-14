@@ -174,6 +174,13 @@ body, 4000 per pane) and caches each pane's wrapped lines until something
 changes. None of this discards data — the full event is always in the buffer and
 in the web UI.
 
+Bodies that carry raw ANSI SGR colour codes (common in shell/tool output — think
+`make`, `kubectl`, or a colourised test runner) are rendered in colour rather than
+shown as literal escape bytes, in both the TUI and the web UI. When a line's own
+colour is present it takes priority over hivewire's kind-based colouring for that
+line, so a red `[FAIL]` a tool printed isn't overridden by, say, the green
+normally used for tool results.
+
 ## Controls
 
 Mouse and keyboard both work, everywhere.

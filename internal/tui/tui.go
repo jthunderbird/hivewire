@@ -16,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/jtaylor/hivewire/internal/hub"
@@ -618,6 +619,18 @@ func (m *Model) body(id string, slot, w int) ([]string, []uint64) {
 	var owners []uint64
 
 	add := func(text string, st lipgloss.Style, seq uint64) {
+		// Tool output frequently carries its own ANSI colour codes (make,
+		// kubectl, colored test runners, …). Trust those over our own
+		// kind-based colour rather than treating the escape bytes as text:
+		// plain rune-width wrapping cannot skip them, so they would otherwise
+		// come out as literal "␛[32m" garbage and mis-measure the line.
+		if hasANSI(text) {
+			for _, chunk := range ansiWrap(text, w) {
+				lines = append(lines, chunk)
+				owners = append(owners, seq)
+			}
+			return
+		}
 		for _, chunk := range wrap(text, w) {
 			lines = append(lines, st.Render(chunk))
 			owners = append(owners, seq)
@@ -773,6 +786,27 @@ func shortModel(s string) string {
 		return "?"
 	}
 	return strings.TrimPrefix(s, "claude-")
+}
+
+// hasANSI reports whether s carries a raw ANSI escape byte, the signal used to
+// decide whether to trust the source's own colouring instead of our own.
+func hasANSI(s string) bool { return strings.IndexByte(s, 0x1b) >= 0 }
+
+// ansiWrap hard-wraps text that already carries ANSI SGR codes, preserving
+// them (ansi.Hardwrap skips escape sequences when measuring width, unlike the
+// plain rune loop in wrap). Every resulting line gets its own reset appended,
+// so a colour a source left open cannot bleed into the rail character, the
+// padding, or an unrelated line rendered after it — lipgloss re-renders the
+// whole screen as one string each frame, so nothing else would stop it.
+func ansiWrap(text string, w int) []string {
+	if w <= 0 {
+		return []string{""}
+	}
+	lines := strings.Split(ansi.Hardwrap(text, w, true), "\n")
+	for i := range lines {
+		lines[i] += ansi.ResetStyle
+	}
+	return lines
 }
 
 // wrap splits plain (unstyled) text into chunks of at most w cells.
