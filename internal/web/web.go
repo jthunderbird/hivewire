@@ -21,6 +21,7 @@ import (
 
 	"github.com/jtaylor/hivewire/internal/hub"
 	"github.com/jtaylor/hivewire/internal/model"
+	"github.com/jtaylor/hivewire/internal/provider/claudebash"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
 	"github.com/jtaylor/hivewire/internal/provider/omp"
@@ -193,6 +194,14 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a, events, err = opencode.Replay(rec.Source, rec.NativeID)
+	case claudebash.Name:
+		// Source is the host transcript the task was launched from, not the
+		// task's own output file, since one host can launch many tasks.
+		if rec.NativeID == "" {
+			http.Error(w, "missing task id", http.StatusBadRequest)
+			return
+		}
+		a, events, err = claudebash.Replay(rec.Source, rec.NativeID)
 	default:
 		http.Error(w, "unknown provider", http.StatusBadRequest)
 		return

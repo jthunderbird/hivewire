@@ -1,6 +1,6 @@
-// Command hivewire streams live Claude Code, Codex, OpenCode and omp subagent
-// activity into a terminal UI and a LAN-reachable web page, four panes at a
-// time.
+// Command hivewire streams live Claude Code, Codex, OpenCode, omp and Claude
+// Code background Bash task activity into a terminal UI and a LAN-reachable
+// web page, four panes at a time.
 package main
 
 import (
@@ -20,6 +20,7 @@ import (
 	"github.com/jtaylor/hivewire/internal/config"
 	"github.com/jtaylor/hivewire/internal/hub"
 	"github.com/jtaylor/hivewire/internal/provider"
+	"github.com/jtaylor/hivewire/internal/provider/claudebash"
 	"github.com/jtaylor/hivewire/internal/provider/claudecode"
 	"github.com/jtaylor/hivewire/internal/provider/codex"
 	"github.com/jtaylor/hivewire/internal/provider/omp"
@@ -154,6 +155,10 @@ func providersFor(cfg config.Config, idle time.Duration, since time.Time) []prov
 		codex.New(cfg.CodexRoot, idle, since),
 		opencode.New(cfg.OpenCodeDB, idle, since),
 		omp.New(cfg.OmpRoot, idle, since),
+		// claudebash reads the same projects directory as claudecode — a
+		// background Bash task is discovered from the session/subagent
+		// transcript it was launched in, not a dedicated root of its own.
+		claudebash.New(cfg.ClaudeRoot, idle, since),
 	}
 }
 

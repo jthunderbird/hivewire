@@ -3,8 +3,8 @@
 </p>
 
 Live, raw view of what your **Claude Code**, **Codex**, **OpenCode** and **omp**
-subagents are doing — four panes at a time, in a terminal UI and a LAN-reachable web
-page, from one binary.
+subagents — plus Claude Code's **background Bash tasks** — are doing, four panes at
+a time, in a terminal UI and a LAN-reachable web page, from one binary.
 
 Existing agent dashboards are hook-fed event feeds. Hooks only carry tool names and
 tool results, so they structurally cannot show assistant text, reasoning, or token
@@ -43,6 +43,14 @@ it does not replay everything you have ever run.
 Only Codex reports the model's context window, so the token figure reads
 `12.4k tok (34% ctx)` there and `12.4k tok (ctx --)` everywhere else rather than
 implying a window nobody published.
+
+**Claude Code background Bash tasks** are a different animal from the four above:
+no model, no reasoning, no structured events — just a shell command's raw
+stdout/stderr. A pane shows `bash (<task id>)` instead of an agent name, its
+"tool call" is the launched command, its tokens read `-`, and its title is the
+command's own description (or the command itself if Claude gave it none).
+Everything else — status dot, elapsed time, folding, history — works exactly the
+same as any other source.
 
 ### TUI
 
@@ -111,6 +119,24 @@ agent type, the resolved model and the entire task it was handed, so no parent r
 is needed for metadata. Completion is read from the hidden `yield` tool every
 subagent must finish through, and from the parent's settled hub job — which also
 supplies the one-line label omp generates for the run.
+
+**Claude Code background Bash tasks** — commands launched with the Bash tool's
+`run_in_background` flag, moved to the background with Ctrl+B, or auto-backgrounded
+after hitting their own timeout — have no dedicated transcript at all. hivewire
+instead reads the same session (and subagent) transcripts `claudecode` already
+tails, for three things that always appear together there: the `tool_use` naming
+the command, its `tool_result` receipt (a launch notice, not a completion, whose
+structured `backgroundTaskId` and embedded path name the raw output file), and
+later a `<task-notification>` block giving the final status:
+
+```
+~/.claude/projects/<slug>/<session>.jsonl                        ← launch + receipt + notification
+/tmp/claude-<uid>/<slug>/<session>/tasks/<task id>.output         ← raw stdout/stderr, tailed line by line
+```
+
+Claude Code's `Monitor`/`TaskStop` condition-watcher and its remote-agent cloud
+review use the same short task-id shape and even land in the same `tasks/`
+directory, but neither is a background *Bash* task, and neither is picked up.
 
 Adding a provider means implementing `provider.Provider` — discover agents, emit
 `model.Agent` + `model.Event`.
@@ -207,6 +233,12 @@ runs are searchable by agent name, model and cwd, but not by prompt. Everything
 the subagent *does* — tool calls, outputs, its messages — is plaintext and streams
 normally. Subagents forked by `codex exec` inherit the parent's prompt, which is
 indexed.
+
+**Claude Code background Bash caveat.** Unlike the other four sources, a task's raw
+output file lives under `/tmp`, not `~/.claude`, and Claude Code does not promise to
+keep it forever — replaying a very old backlog entry can fail if the file is gone.
+The session transcript itself (command, description, status) is permanent and
+always searchable; only the output body is at risk.
 
 Codex reasoning is encrypted unless summaries are enabled. hivewire already
 renders reasoning as its own event kind, so turning them on makes it visible:

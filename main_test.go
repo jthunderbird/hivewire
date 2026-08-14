@@ -15,7 +15,7 @@ func TestProvidersForCoversEverySupportedCLI(t *testing.T) {
 	for _, p := range providersFor(cfg, time.Minute, time.Now()) {
 		names = append(names, p.Name())
 	}
-	want := []string{"claude", "codex", "opencode", "omp"}
+	want := []string{"claude", "codex", "opencode", "omp", "claude-background"}
 	if len(names) != len(want) {
 		t.Fatalf("provider names = %v, want %v", names, want)
 	}

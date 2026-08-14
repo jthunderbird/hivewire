@@ -28,8 +28,8 @@ type Tokens struct {
 type Agent struct {
 	ID       string `json:"id"`       // globally unique: "<provider>:<native id>"
 	NativeID string `json:"nativeId"` // provider-local id
-	Provider string `json:"provider"` // "claude" | "codex" | "opencode"
-	Model    string `json:"model"`
+	Provider string `json:"provider"` // "claude" | "codex" | "opencode" | "omp" | "claude-background"
+	Model    string `json:"model"`    // empty for claude-background: it runs no model at all
 
 	Name     string `json:"name"`     // claude: agentType; codex: basename(agent_path); opencode: agent
 	Nickname string `json:"nickname"` // codex only
